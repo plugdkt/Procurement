@@ -1,0 +1,36 @@
+# Database & Configuration secrets
+config.php
+.env
+.env.*
+*.local
+
+# Sensitive test files
+login/authenticate.php
+
+# Uploaded documents and announcement attachments
+/uploads/*
+!/uploads/.gitkeep
+!/uploads/web.config
+
+# Logs, databases, and temporary files
+*.log
+*.sql
+*.sqlite
+*.bak
+*.tmp
+*.cache
+
+# OS & Editor files
+.DS_Store
+Thumbs.db
+desktop.ini
+.idea/
+.vscode/
+*.suo
+*.ntvs*
+*.njsproj
+*.user
+
+# CVS directories
+**/CVS/
+**/CVS/*

@@ -1,0 +1,23 @@
+
+POST /mobile/StaffService.asmx/GetRegStaffInfo HTTP/1.1
+Host: ws.up.ac.th
+Content-Type: application/x-www-form-urlencoded
+Content-Length: length
+
+sessionID=string
+
+HTTP/1.1 200 OK
+Content-Type: text/xml; charset=utf-8
+Content-Length: length
+
+<?xml version="1.0" encoding="utf-8"?>
+<StaffInfo xmlns="http://tempuri.org/">
+  <Title>string</Title>
+  <FirstName_TH>string</FirstName_TH>
+  <LastName_TH>string</LastName_TH>
+  <CitizenID>string</CitizenID>
+  <Department>string</Department>
+  <Faculty>string</Faculty>
+  <Status>string</Status>
+  <GroupType>string</GroupType>
+</StaffInfo>
