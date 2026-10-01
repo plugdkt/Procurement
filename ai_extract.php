@@ -79,37 +79,96 @@ function ai_extract_projects($pdf_path, $fiscal_year_be) {
         . "- Include every project row, including rows continued across pages. Skip header, subtotal and grand-total rows.\n"
         . "- Copy names exactly; do not translate or summarise.\n"
         . "- Never invent values: use \"\" for text you cannot find and explain in note. If a budget is unreadable, give your best reading and say so in note.\n"
-        . "- Call the save_projects tool exactly once with all projects. Do not answer in plain text.";
+        . "- Return a pure JSON array containing the project items.";
 
-    $body = [
-        'model' => AI_MODEL,
-        'max_tokens' => 16000,
-        'stream' => false,
-        'system' => $system,
-        'tools' => [ai_project_tool()],
-        'tool_choice' => ['type' => 'auto'],
-        'messages' => [[
-            'role' => 'user',
-            'content' => [
-                ['type' => 'document', 'source' => ['type' => 'base64', 'media_type' => 'application/pdf', 'data' => base64_encode(file_get_contents($pdf_path))]],
-                ['type' => 'text', 'text' => 'Extract all procurement projects from this plan.'],
+    $is_gemini_native = (strpos(AI_BASE_URL, 'generativelanguage.googleapis.com') !== false);
+
+    if ($is_gemini_native) {
+        // Direct Google Gemini API
+        $url = rtrim(AI_BASE_URL, '/') . '/models/' . AI_MODEL . ':generateContent?key=' . AI_API_KEY;
+        $prompt = $system . "\n\nExtract all procurement projects from this Thai annual procurement plan PDF. Return a JSON array where each object has fields: "
+            . "project_name (string), budget (number), procurement_type (string: 'จัดซื้อ','จัดจ้าง','เช่า'), quantity (string), "
+            . "procurement_method (string: 'เฉพาะเจาะจง','ประกวดราคาอิเล็กทรอนิกส์ (e-bidding)','คัดเลือก','สอบราคา'), "
+            . "required_date (YYYY-MM), request_month (YYYY-MM), contract_month (YYYY-MM), page (integer), note (string).";
+        
+        $body = [
+            'contents' => [[
+                'parts' => [
+                    ['text' => $prompt],
+                    ['inline_data' => [
+                        'mime_type' => 'application/pdf',
+                        'data' => base64_encode(file_get_contents($pdf_path))
+                    ]]
+                ]
+            ]],
+            'generationConfig' => [
+                'responseMimeType' => 'application/json',
+                'maxOutputTokens' => 16000
+            ]
+        ];
+
+        $ch = curl_init($url);
+        $curl_opts = [
+            CURLOPT_POST => true,
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_CONNECTTIMEOUT => 15,
+            CURLOPT_TIMEOUT => 300,
+            CURLOPT_HTTPHEADER => ['content-type: application/json'],
+            CURLOPT_POSTFIELDS => json_encode($body, JSON_UNESCAPED_UNICODE),
+        ];
+    } else {
+        // Anthropic Messages API compatible gateway
+        $body = [
+            'model' => AI_MODEL,
+            'max_tokens' => 16000,
+            'stream' => false,
+            'system' => $system . "\n- Call the save_projects tool exactly once with all projects. Do not answer in plain text.",
+            'tools' => [ai_project_tool()],
+            'tool_choice' => ['type' => 'auto'],
+            'messages' => [[
+                'role' => 'user',
+                'content' => [
+                    ['type' => 'document', 'source' => ['type' => 'base64', 'media_type' => 'application/pdf', 'data' => base64_encode(file_get_contents($pdf_path))]],
+                    ['type' => 'text', 'text' => 'Extract all procurement projects from this plan.'],
+                ],
+            ]],
+        ];
+
+        $ch = curl_init(rtrim(AI_BASE_URL, '/') . '/messages');
+        $curl_opts = [
+            CURLOPT_POST => true,
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_CONNECTTIMEOUT => 15,
+            CURLOPT_TIMEOUT => 300,
+            CURLOPT_HTTPHEADER => [
+                'content-type: application/json',
+                'anthropic-version: 2023-06-01',
+                'x-api-key' => AI_API_KEY,
             ],
-        ]],
-    ];
+            CURLOPT_POSTFIELDS => json_encode($body, JSON_UNESCAPED_UNICODE),
+        ];
+    }
 
-    $ch = curl_init(rtrim(AI_BASE_URL, '/') . '/messages');
-    curl_setopt_array($ch, [
-        CURLOPT_POST => true,
-        CURLOPT_RETURNTRANSFER => true,
-        CURLOPT_CONNECTTIMEOUT => 15,
-        CURLOPT_TIMEOUT => 300,
-        CURLOPT_HTTPHEADER => [
-            'content-type: application/json',
-            'anthropic-version: 2023-06-01',
-            'x-api-key: ' . AI_API_KEY,
-        ],
-        CURLOPT_POSTFIELDS => json_encode($body, JSON_UNESCAPED_UNICODE),
-    ]);
+    // Check for standard CA bundles on Windows PHP environments
+    $ca_paths = [
+        'C:\Program Files (x86)\PHP\8.2.14\extras\ssl\cacert.pem',
+        ini_get('curl.cainfo'),
+        ini_get('openssl.cafile')
+    ];
+    $ca_found = false;
+    foreach ($ca_paths as $cap) {
+        if (!empty($cap) && is_file($cap)) {
+            $curl_opts[CURLOPT_CAINFO] = $cap;
+            $ca_found = true;
+            break;
+        }
+    }
+    if (!$ca_found) {
+        $curl_opts[CURLOPT_SSL_VERIFYPEER] = false;
+        $curl_opts[CURLOPT_SSL_VERIFYHOST] = 0;
+    }
+
+    curl_setopt_array($ch, $curl_opts);
     $raw = curl_exec($ch);
     $curl_error = curl_error($ch);
     $status = (int)curl_getinfo($ch, CURLINFO_HTTP_CODE);
@@ -123,37 +182,53 @@ function ai_extract_projects($pdf_path, $fiscal_year_be) {
     if ($status !== 200 || !is_array($resp)) {
         error_log('AI extract HTTP ' . $status . ': ' . substr($raw, 0, 1000));
         if ($status === 429) {
-            throw new RuntimeException('ใช้งาน AI เกินโควตาที่กำหนดแล้ว (โควตารายวัน) กรุณาลองใหม่ภายหลัง');
+            throw new RuntimeException('ใช้งาน AI เกินโควตาที่กำหนดแล้ว กรุณาลองใหม่ภายหลัง');
         }
         if ($status === 401 || $status === 403) {
             throw new RuntimeException('API key ของบริการ AI ไม่ถูกต้องหรือหมดสิทธิ์ใช้งาน');
         }
+        if ($status === 503) {
+            throw new RuntimeException('บริการ AI มีผู้ใช้งานหนาแน่นชั่วคราว กรุณากดลองใหม่อีกครั้งในอีกสักครู่');
+        }
         throw new RuntimeException('บริการ AI ตอบกลับผิดพลาด (HTTP ' . $status . ') กรุณาลองใหม่อีกครั้ง');
     }
 
-    $stop = $resp['stop_reason'] ?? '';
-    if ($stop === 'refusal') {
-        throw new RuntimeException('AI ปฏิเสธการประมวลผลเอกสารนี้');
-    }
-    if ($stop === 'max_tokens') {
-        throw new RuntimeException('เอกสารมีโครงการจำนวนมากเกินกว่าที่ AI จะตอบได้ในครั้งเดียว กรุณาแยกไฟล์ PDF เป็นส่วนย่อย');
+    $projects = null;
+    $usage = [];
+
+    if ($is_gemini_native) {
+        $text = $resp['candidates'][0]['content']['parts'][0]['text'] ?? '';
+        $parsed = json_decode($text, true);
+        if (is_array($parsed)) {
+            $projects = isset($parsed['projects']) ? $parsed['projects'] : $parsed;
+        }
+        $usage = $resp['usageMetadata'] ?? [];
+    } else {
+        $stop = $resp['stop_reason'] ?? '';
+        if ($stop === 'refusal') {
+            throw new RuntimeException('AI ปฏิเสธการประมวลผลเอกสารนี้');
+        }
+        if ($stop === 'max_tokens') {
+            throw new RuntimeException('เอกสารมีโครงการจำนวนมากเกินกว่าที่ AI จะตอบได้ในครั้งเดียว กรุณาแยกไฟล์ PDF เป็นส่วนย่อย');
+        }
+
+        foreach ($resp['content'] ?? [] as $block) {
+            if (($block['type'] ?? '') === 'tool_use' && ($block['name'] ?? '') === 'save_projects') {
+                $projects = $block['input']['projects'] ?? null;
+                break;
+            }
+        }
+        $usage = $resp['usage'] ?? [];
     }
 
-    $projects = null;
-    foreach ($resp['content'] ?? [] as $block) {
-        if (($block['type'] ?? '') === 'tool_use' && ($block['name'] ?? '') === 'save_projects') {
-            $projects = $block['input']['projects'] ?? null;
-            break;
-        }
-    }
     if (!is_array($projects)) {
-        error_log('AI extract: no save_projects tool call: ' . substr($raw, 0, 1000));
+        error_log('AI extract: could not parse projects: ' . substr($raw, 0, 1000));
         throw new RuntimeException('AI ไม่สามารถดึงรายการโครงการจากเอกสารนี้ได้ กรุณาตรวจสอบว่าเป็นไฟล์แผนจัดซื้อจัดจ้าง');
     }
 
     return [
         'projects' => array_values(array_map('ai_normalize_project', $projects)),
-        'usage' => $resp['usage'] ?? [],
+        'usage' => $usage,
         'quota' => $resp['model_quota'] ?? null,
     ];
 }
