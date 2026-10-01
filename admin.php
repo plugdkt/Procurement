@@ -2,6 +2,7 @@
 // admin.php - Administrative Control Panel (Annual Plans & Projects Management)
 require_once 'db.php';
 require_once 'security.php';
+require_once 'ai_extract.php';
 secure_session_start();
 
 // Authentication Check
@@ -855,6 +856,109 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
         header('Location: admin.php?view=tracking_detail&id=' . $project_id);
         exit();
     }
+
+    // AI: read the plan PDF and keep the extracted projects as a draft for review
+    if ($action === 'ai_extract_plan') {
+        $plan_id = intval($_POST['plan_id'] ?? 0);
+        $stmt = $pdo->prepare("SELECT * FROM plans WHERE id = ?");
+        $stmt->execute([$plan_id]);
+        $plan = $stmt->fetch();
+        if (!$plan) {
+            header('Location: admin.php?view=plans');
+            exit();
+        }
+
+        @set_time_limit(330);
+        // Release the session lock while waiting for the AI so other tabs keep working
+        session_write_close();
+        try {
+            $result = ai_extract_projects(__DIR__ . '/' . $plan['file_path'], $plan['fiscal_year']);
+            secure_session_start();
+            $_SESSION['ai_extract'][$plan_id] = [
+                'projects' => $result['projects'],
+                'usage' => $result['usage'],
+                'quota' => $result['quota'],
+                'created_at' => time(),
+            ];
+            if (empty($result['projects'])) {
+                $_SESSION['error_flash'] = 'AI ไม่พบรายการโครงการในไฟล์แผนนี้';
+                header('Location: admin.php?view=plan_detail&id=' . $plan_id);
+            } else {
+                header('Location: admin.php?view=ai_review&plan_id=' . $plan_id);
+            }
+        } catch (RuntimeException $e) {
+            secure_session_start();
+            $_SESSION['error_flash'] = $e->getMessage();
+            header('Location: admin.php?view=plan_detail&id=' . $plan_id);
+        }
+        exit();
+    }
+
+    // AI: discard the draft
+    if ($action === 'ai_discard') {
+        $plan_id = intval($_POST['plan_id'] ?? 0);
+        unset($_SESSION['ai_extract'][$plan_id]);
+        header('Location: admin.php?view=plan_detail&id=' . $plan_id);
+        exit();
+    }
+
+    // AI: create the reviewed projects
+    if ($action === 'ai_import_projects') {
+        $plan_id = intval($_POST['plan_id'] ?? 0);
+        $rows = is_array($_POST['rows'] ?? null) ? $_POST['rows'] : [];
+        $selected = is_array($_POST['selected'] ?? null) ? $_POST['selected'] : [];
+
+        $stmt = $pdo->prepare("SELECT COUNT(*) FROM plans WHERE id = ?");
+        $stmt->execute([$plan_id]);
+        if (!$stmt->fetchColumn() || !isset($_SESSION['ai_extract'][$plan_id])) {
+            header('Location: admin.php?view=plans');
+            exit();
+        }
+
+        // Keep the reviewer's edits in the draft so they survive a validation error
+        $draft = [];
+        $to_insert = [];
+        $invalid_rows = [];
+        foreach (array_values($rows) as $i => $row) {
+            $row = is_array($row) ? $row : [];
+            $item = ai_normalize_project($row);
+            $item['selected'] = isset($selected[$i]);
+            $draft[] = $item;
+            if (!$item['selected']) continue;
+
+            if ($item['project_name'] === '' || $item['budget'] <= 0 || $item['procurement_type'] === '' || $item['quantity'] === '' || $item['procurement_method'] === '') {
+                $invalid_rows[] = $i + 1;
+            } else {
+                $to_insert[] = $item;
+            }
+        }
+        $_SESSION['ai_extract'][$plan_id]['projects'] = $draft;
+
+        if (empty($to_insert) && empty($invalid_rows)) {
+            $_SESSION['error_flash'] = 'กรุณาเลือกอย่างน้อย 1 โครงการ';
+        } elseif (!empty($invalid_rows)) {
+            $_SESSION['error_flash'] = 'ข้อมูลยังไม่ครบในแถวที่ ' . implode(', ', $invalid_rows) . ' (ต้องมีชื่อโครงการ งบประมาณ ประเภท ปริมาณ และวิธีจัดซื้อจัดจ้าง)';
+        } else {
+            try {
+                $pdo->beginTransaction();
+                $ins = $pdo->prepare("INSERT INTO projects (plan_id, project_name, budget, procurement_type, quantity, required_date, procurement_method, request_month, contract_month, responsible_person, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, '', 'planning')");
+                foreach ($to_insert as $item) {
+                    $ins->execute([$plan_id, $item['project_name'], $item['budget'], $item['procurement_type'], $item['quantity'], $item['required_date'], $item['procurement_method'], $item['request_month'], $item['contract_month']]);
+                }
+                $pdo->commit();
+                unset($_SESSION['ai_extract'][$plan_id]);
+                $_SESSION['success_flash'] = 'เพิ่มโครงการจากไฟล์แผนด้วย AI สำเร็จ ' . count($to_insert) . ' โครงการ';
+                header('Location: admin.php?view=plan_detail&id=' . $plan_id);
+                exit();
+            } catch (Exception $e) {
+                $pdo->rollBack();
+                error_log('AI import failed: ' . $e->getMessage());
+                $_SESSION['error_flash'] = 'บันทึกโครงการไม่สำเร็จ ไม่มีโครงการใดถูกบันทึก กรุณาลองใหม่';
+            }
+        }
+        header('Location: admin.php?view=ai_review&plan_id=' . $plan_id);
+        exit();
+    }
 }
 
 // I. Delete Installment (GET action outside POST block)
@@ -1211,9 +1315,27 @@ $all_projects = $projects_stmt->fetchAll();
                                 </a>
                             </div>
                         </div>
-                        <button type="button" class="btn btn-primary" onclick="openAddProject(<?= $plan_info['id'] ?>)">
-                            + เพิ่มโครงการภายใต้แผนนี้
-                        </button>
+                        <div style="display: flex; gap: 10px; flex-wrap: wrap;">
+                            <?php if (ai_is_configured()): ?>
+                                <?php if (isset($_SESSION['ai_extract'][$plan_info['id']])): ?>
+                                    <a href="admin.php?view=ai_review&plan_id=<?= $plan_info['id'] ?>" class="btn btn-secondary">
+                                        ตรวจสอบรายการที่ AI ดึงไว้ (<?= count($_SESSION['ai_extract'][$plan_info['id']]['projects']) ?>)
+                                    </a>
+                                <?php endif; ?>
+                                <form action="admin.php" method="POST" style="margin: 0;"
+                                      onsubmit="const b = this.querySelector('button'); b.disabled = true; b.textContent = 'AI กำลังอ่านไฟล์แผน... (อาจใช้เวลา 1-3 นาที)';">
+                                    <input type="hidden" name="action" value="ai_extract_plan">
+                                    <?= csrf_field() ?>
+                                    <input type="hidden" name="plan_id" value="<?= $plan_info['id'] ?>">
+                                    <button type="submit" class="btn btn-secondary" title="ให้ AI อ่านไฟล์ PDF ของแผนนี้และเสนอรายการโครงการให้ตรวจสอบก่อนบันทึก">
+                                        ✨ ดึงโครงการจากไฟล์แผนด้วย AI
+                                    </button>
+                                </form>
+                            <?php endif; ?>
+                            <button type="button" class="btn btn-primary" onclick="openAddProject(<?= $plan_info['id'] ?>)">
+                                + เพิ่มโครงการภายใต้แผนนี้
+                            </button>
+                        </div>
                     </div>
                 </section>
 
@@ -2304,6 +2426,132 @@ $all_projects = $projects_stmt->fetchAll();
             <?php endif; ?>
 
             <!-- View 4: Change Password -->
+            <?php elseif ($view === 'ai_review'):
+                $plan_id = intval($_GET['plan_id'] ?? 0);
+                $plan_stmt = $pdo->prepare("SELECT * FROM plans WHERE id = ?");
+                $plan_stmt->execute([$plan_id]);
+                $plan_info = $plan_stmt->fetch();
+                $ai_draft = $_SESSION['ai_extract'][$plan_id] ?? null;
+            ?>
+                <?php if (!$plan_info || !$ai_draft): ?>
+                    <div class="alert-message alert-danger">ไม่พบรายการที่ AI ดึงไว้ หรือรายการถูกบันทึก/ยกเลิกไปแล้ว</div>
+                    <a href="admin.php?view=plans" class="btn btn-secondary">&larr; กลับไปยังรายการแผน</a>
+                <?php else:
+                    // Flag names that already exist under this plan to avoid duplicates
+                    $existing_stmt = $pdo->prepare("SELECT project_name FROM projects WHERE plan_id = ?");
+                    $existing_stmt->execute([$plan_id]);
+                    $normalize_name = function ($name) { return preg_replace('/\s+/u', '', mb_strtolower((string)$name)); };
+                    $existing_names = array_flip(array_map($normalize_name, $existing_stmt->fetchAll(PDO::FETCH_COLUMN)));
+                    $ai_rows = $ai_draft['projects'];
+                    $ai_total_budget = array_sum(array_column($ai_rows, 'budget'));
+                    $month_input = function ($i, $field, $value) {
+                        return '<input type="month" name="rows[' . $i . '][' . $field . ']" value="' . htmlspecialchars($value) . '" class="form-control" style="padding:6px; font-size:0.85rem; min-width:140px;">';
+                    };
+            ?>
+                <div style="margin-bottom: 24px;">
+                    <a href="admin.php?view=plan_detail&id=<?= $plan_id ?>" class="btn btn-secondary" style="padding: 8px 16px;">
+                        &larr; กลับไปยังรายละเอียดแผน
+                    </a>
+                </div>
+
+                <section class="card-table-wrap">
+                    <div class="card-table-header" style="flex-wrap: wrap; gap: 12px;">
+                        <div>
+                            <h2>ตรวจสอบโครงการที่ AI ดึงจากไฟล์แผน (<?= count($ai_rows) ?> รายการ)</h2>
+                            <p style="font-size: 0.85rem; color: var(--text-muted); margin-top: 4px;">
+                                <?= htmlspecialchars($plan_info['plan_name']) ?> (พ.ศ. <?= $plan_info['fiscal_year'] ?>) &middot;
+                                งบประมาณรวมที่อ่านได้ <?= number_format($ai_total_budget, 2) ?> บาท &middot;
+                                <a href="<?= htmlspecialchars($plan_info['file_path']) ?>" target="_blank">เปิดไฟล์ PDF ต้นฉบับเพื่อเทียบ</a>
+                            </p>
+                            <?php if (!empty($ai_draft['quota']['daily_remaining_tokens'])): ?>
+                                <p style="font-size: 0.8rem; color: var(--text-muted); margin-top: 2px;">
+                                    ใช้ไป <?= number_format(($ai_draft['usage']['input_tokens'] ?? 0) + ($ai_draft['usage']['output_tokens'] ?? 0)) ?> tokens &middot;
+                                    โควตา AI คงเหลือวันนี้ <?= number_format($ai_draft['quota']['daily_remaining_tokens']) ?> / <?= number_format($ai_draft['quota']['daily_quota_tokens'] ?? 0) ?> tokens (ณ เวลาที่ดึงข้อมูล)
+                                </p>
+                            <?php endif; ?>
+                        </div>
+                    </div>
+                    <div class="alert-message" style="margin: 16px 24px 0; background: #fffbeb; color: #92400e; border: 1px solid #fde68a;">
+                        ข้อมูลนี้อ่านโดย AI อาจมีความคลาดเคลื่อน กรุณาตรวจสอบ <strong>ชื่อโครงการและงบประมาณ</strong> กับไฟล์ต้นฉบับก่อนบันทึก
+                        &mdash; รายการที่ชื่อซ้ำกับโครงการเดิมในแผนนี้จะไม่ถูกเลือกไว้
+                    </div>
+
+                    <form action="admin.php" method="POST" id="ai-import-form">
+                        <input type="hidden" name="action" value="ai_import_projects">
+                        <?= csrf_field() ?>
+                        <input type="hidden" name="plan_id" value="<?= $plan_id ?>">
+                        <div class="table-responsive" style="padding: 16px 0;">
+                            <table class="table-admin" style="font-size: 0.85rem;">
+                                <thead>
+                                    <tr>
+                                        <th style="text-align:center;"><input type="checkbox" <?= count(array_filter($ai_rows, function ($r) use ($existing_names, $normalize_name) { return !($r['selected'] ?? !isset($existing_names[$normalize_name($r['project_name'])])); })) === 0 ? 'checked' : '' ?> onclick="document.querySelectorAll('.ai-row-check').forEach(c => c.checked = this.checked)" title="เลือก/ไม่เลือกทั้งหมด"></th>
+                                        <th>#</th>
+                                        <th style="min-width:260px;">ชื่อโครงการ</th>
+                                        <th style="min-width:140px;">งบประมาณ (บาท)</th>
+                                        <th style="min-width:110px;">ประเภท</th>
+                                        <th style="min-width:120px;">ปริมาณ</th>
+                                        <th style="min-width:250px;">วิธีจัดซื้อจัดจ้าง</th>
+                                        <th>เดือนขอซื้อ</th>
+                                        <th>เดือนทำสัญญา</th>
+                                        <th>ต้องการใช้</th>
+                                        <th style="min-width:160px;">หมายเหตุจาก AI</th>
+                                    </tr>
+                                </thead>
+                                <tbody>
+                                    <?php foreach ($ai_rows as $i => $row):
+                                        $is_duplicate = isset($existing_names[$normalize_name($row['project_name'])]);
+                                        $is_checked = $row['selected'] ?? !$is_duplicate;
+                                    ?>
+                                    <tr style="<?= $is_duplicate ? 'background:#fef2f2;' : '' ?>">
+                                        <td style="text-align:center;"><input type="checkbox" class="ai-row-check" name="selected[<?= $i ?>]" value="1" <?= $is_checked ? 'checked' : '' ?>></td>
+                                        <td><?= $i + 1 ?><?php if (!empty($row['page'])): ?><div style="font-size:0.7rem; color:var(--text-muted);">หน้า <?= (int)$row['page'] ?></div><?php endif; ?></td>
+                                        <td>
+                                            <textarea name="rows[<?= $i ?>][project_name]" class="form-control" rows="2" style="padding:6px; font-size:0.85rem;"><?= htmlspecialchars($row['project_name']) ?></textarea>
+                                            <?php if ($is_duplicate): ?><div style="color:#b91c1c; font-size:0.75rem; margin-top:2px;">มีโครงการชื่อนี้ในแผนอยู่แล้ว</div><?php endif; ?>
+                                        </td>
+                                        <td><input type="number" step="0.01" min="0" name="rows[<?= $i ?>][budget]" value="<?= htmlspecialchars((string)$row['budget']) ?>" class="form-control" style="padding:6px; font-size:0.85rem;"></td>
+                                        <td>
+                                            <select name="rows[<?= $i ?>][procurement_type]" class="form-control" style="padding:6px; font-size:0.85rem;">
+                                                <option value="">-- เลือก --</option>
+                                                <?php foreach (AI_PROCUREMENT_TYPES as $opt): ?>
+                                                    <option value="<?= $opt ?>" <?= $row['procurement_type'] === $opt ? 'selected' : '' ?>><?= $opt ?></option>
+                                                <?php endforeach; ?>
+                                            </select>
+                                        </td>
+                                        <td><input type="text" name="rows[<?= $i ?>][quantity]" value="<?= htmlspecialchars($row['quantity']) ?>" class="form-control" style="padding:6px; font-size:0.85rem;"></td>
+                                        <td>
+                                            <select name="rows[<?= $i ?>][procurement_method]" class="form-control" style="padding:6px; font-size:0.85rem;">
+                                                <option value="">-- เลือก --</option>
+                                                <?php foreach (AI_PROCUREMENT_METHODS as $opt): ?>
+                                                    <option value="<?= $opt ?>" <?= $row['procurement_method'] === $opt ? 'selected' : '' ?>><?= $opt ?></option>
+                                                <?php endforeach; ?>
+                                            </select>
+                                        </td>
+                                        <td><?= $month_input($i, 'request_month', $row['request_month']) ?></td>
+                                        <td><?= $month_input($i, 'contract_month', $row['contract_month']) ?></td>
+                                        <td><?= $month_input($i, 'required_date', $row['required_date']) ?></td>
+                                        <td style="color:#92400e; font-size:0.8rem;"><?= htmlspecialchars($row['note']) ?></td>
+                                    </tr>
+                                    <?php endforeach; ?>
+                                </tbody>
+                            </table>
+                        </div>
+                    </form>
+                    <div style="display:flex; gap:12px; justify-content:flex-end; flex-wrap:wrap; padding: 0 24px 24px;">
+                        <form action="admin.php" method="POST" style="margin:0;" onsubmit="return confirm('ยกเลิกรายการที่ AI ดึงไว้ทั้งหมด?');">
+                            <input type="hidden" name="action" value="ai_discard">
+                            <?= csrf_field() ?>
+                            <input type="hidden" name="plan_id" value="<?= $plan_id ?>">
+                            <button type="submit" class="btn btn-danger">ยกเลิกรายการทั้งหมด</button>
+                        </form>
+                        <button type="submit" form="ai-import-form" class="btn btn-primary"
+                                onclick="const n = document.querySelectorAll('.ai-row-check:checked').length; return n > 0 ? confirm('บันทึก ' + n + ' โครงการที่เลือกเข้าสู่แผนนี้?') : (alert('กรุณาเลือกอย่างน้อย 1 โครงการ'), false);">
+                            บันทึกโครงการที่เลือก
+                        </button>
+                    </div>
+                </section>
+                <?php endif; ?>
+
             <?php elseif ($view === 'password'): ?>
                 <section class="card-table-wrap" style="max-width: 500px; margin: 0 auto;">
                     <div class="card-table-header">

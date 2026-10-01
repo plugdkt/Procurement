@@ -662,6 +662,7 @@ a:hover {
     background-color: var(--bg-base);
     padding: 40px;
     overflow-y: auto;
+    min-width: 0; /* let wide tables scroll inside .table-responsive instead of widening the page */
 }
 
 .admin-header {
