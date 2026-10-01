@@ -46,6 +46,18 @@ if ($is_write_request) {
     }
 }
 
+// Merge one AI extraction result into the per-plan review draft kept in the session
+function ai_draft_add($plan_id, array $result, $reset) {
+    if ($reset || !isset($_SESSION['ai_extract'][$plan_id])) {
+        $_SESSION['ai_extract'][$plan_id] = ['projects' => [], 'usage' => ['input_tokens' => 0, 'output_tokens' => 0], 'quotas' => [], 'created_at' => time()];
+    }
+    $draft = &$_SESSION['ai_extract'][$plan_id];
+    $draft['projects'] = array_merge($draft['projects'], $result['projects']);
+    $draft['usage']['input_tokens'] += (int)($result['usage']['input_tokens'] ?? 0);
+    $draft['usage']['output_tokens'] += (int)($result['usage']['output_tokens'] ?? 0);
+    $draft['quotas'][$result['model']] = $result['quota'];
+}
+
 // Only a superadmin may create, modify or delete superadmin accounts
 function can_manage_role($actor_role, $target_role) {
     return $target_role !== 'superadmin' || $actor_role === 'superadmin';
@@ -874,12 +886,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
         try {
             $result = ai_extract_projects(__DIR__ . '/' . $plan['file_path'], $plan['fiscal_year']);
             secure_session_start();
-            $_SESSION['ai_extract'][$plan_id] = [
-                'projects' => $result['projects'],
-                'usage' => $result['usage'],
-                'quota' => $result['quota'],
-                'created_at' => time(),
-            ];
+            ai_draft_add($plan_id, $result, true);
             if (empty($result['projects'])) {
                 $_SESSION['error_flash'] = 'AI ไม่พบรายการโครงการในไฟล์แผนนี้';
                 header('Location: admin.php?view=plan_detail&id=' . $plan_id);
@@ -890,6 +897,81 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
             secure_session_start();
             $_SESSION['error_flash'] = $e->getMessage();
             header('Location: admin.php?view=plan_detail&id=' . $plan_id);
+        }
+        exit();
+    }
+
+    // AI: extract projects from the whole plan PDF in one request (JSON response).
+    // Answers need_images when the file is too large for the available providers.
+    if ($action === 'ai_extract_pdf') {
+        header('Content-Type: application/json; charset=utf-8');
+        $plan_id = intval($_POST['plan_id'] ?? 0);
+        $stmt = $pdo->prepare("SELECT * FROM plans WHERE id = ?");
+        $stmt->execute([$plan_id]);
+        $plan = $stmt->fetch();
+        if (!$plan) {
+            echo json_encode(['ok' => false, 'error' => 'ไม่พบแผนงาน'], JSON_UNESCAPED_UNICODE);
+            exit();
+        }
+        
+        @set_time_limit(300);
+        session_write_close();
+        try {
+            $result = ai_extract_projects(__DIR__ . '/' . $plan['file_path'], $plan['fiscal_year']);
+            secure_session_start();
+            ai_draft_add($plan_id, $result, true);
+            echo json_encode(['ok' => true, 'count' => count($result['projects']), 'model' => $result['model']], JSON_UNESCAPED_UNICODE);
+        } catch (AiNeedsPageImagesException $e) {
+            echo json_encode(['ok' => false, 'need_images' => true, 'error' => $e->getMessage()], JSON_UNESCAPED_UNICODE);
+        } catch (RuntimeException $e) {
+            echo json_encode(['ok' => false, 'error' => $e->getMessage()], JSON_UNESCAPED_UNICODE);
+        }
+        exit();
+    }
+    
+    // AI: extract projects from one batch of page images rendered in the browser (JSON response)
+    if ($action === 'ai_extract_batch') {
+        header('Content-Type: application/json; charset=utf-8');
+        $plan_id = intval($_POST['plan_id'] ?? 0);
+        $batch_index = intval($_POST['batch_index'] ?? 0);
+        $total_pages = intval($_POST['total_pages'] ?? 0);
+        $page_numbers = array_map('intval', is_array($_POST['pages'] ?? null) ? $_POST['pages'] : []);
+        $files = $_FILES['images'] ?? null;
+
+        $stmt = $pdo->prepare("SELECT fiscal_year FROM plans WHERE id = ?");
+        $stmt->execute([$plan_id]);
+        $fiscal_year = $stmt->fetchColumn();
+
+        $pages = [];
+        $count = is_array($files['tmp_name'] ?? null) ? count($files['tmp_name']) : 0;
+        $total_bytes = 0;
+        for ($i = 0; $i < $count; $i++) {
+            if ($files['error'][$i] !== UPLOAD_ERR_OK || mime_content_type($files['tmp_name'][$i]) !== 'image/jpeg') {
+                $pages = null;
+                break;
+            }
+            $total_bytes += $files['size'][$i];
+            $pages[] = ['page' => $page_numbers[$i] ?? ($i + 1), 'path' => $files['tmp_name'][$i]];
+        }
+
+        if (!$fiscal_year || empty($pages) || $total_pages <= 0) {
+            echo json_encode(['ok' => false, 'error' => 'ข้อมูลภาพหน้าเอกสารไม่ถูกต้อง กรุณาลองใหม่อีกครั้ง'], JSON_UNESCAPED_UNICODE);
+            exit();
+        }
+        if ($total_bytes > AI_MAX_BATCH_IMAGE_BYTES) {
+            echo json_encode(['ok' => false, 'error' => 'ภาพหน้าเอกสารชุดนี้มีขนาดใหญ่เกินไป'], JSON_UNESCAPED_UNICODE);
+            exit();
+        }
+
+        @set_time_limit(300);
+        session_write_close();
+        try {
+            $result = ai_extract_from_images($pages, $fiscal_year, $total_pages);
+            secure_session_start();
+            ai_draft_add($plan_id, $result, $batch_index === 0);
+            echo json_encode(['ok' => true, 'count' => count($result['projects']), 'model' => $result['model']], JSON_UNESCAPED_UNICODE);
+        } catch (RuntimeException $e) {
+            echo json_encode(['ok' => false, 'error' => $e->getMessage()], JSON_UNESCAPED_UNICODE);
         }
         exit();
     }
@@ -1322,8 +1404,9 @@ $all_projects = $projects_stmt->fetchAll();
                                         ตรวจสอบรายการที่ AI ดึงไว้ (<?= count($_SESSION['ai_extract'][$plan_info['id']]['projects']) ?>)
                                     </a>
                                 <?php endif; ?>
-                                <form action="admin.php" method="POST" style="margin: 0;"
-                                      onsubmit="const b = this.querySelector('button'); b.disabled = true; b.textContent = 'AI กำลังอ่านไฟล์แผน... (อาจใช้เวลา 1-3 นาที)';">
+                                <form action="admin.php" method="POST" style="margin: 0;" id="ai-extract-form"
+                                      data-pdf="<?= htmlspecialchars($plan_info['file_path']) ?>" data-max-batch-bytes="<?= AI_MAX_BATCH_IMAGE_BYTES ?>"
+                                      onsubmit="if (typeof aiExtractPlan === 'function') return aiExtractPlan(this); alert('หน้าเว็บยังโหลดไม่เสร็จ กรุณารอสักครู่แล้วกดอีกครั้ง'); return false;">
                                     <input type="hidden" name="action" value="ai_extract_plan">
                                     <?= csrf_field() ?>
                                     <input type="hidden" name="plan_id" value="<?= $plan_info['id'] ?>">
@@ -1338,6 +1421,118 @@ $all_projects = $projects_stmt->fetchAll();
                         </div>
                     </div>
                 </section>
+
+                <div id="ai-progress" class="alert-message" style="display:none; background:#eff6ff; color:#1e40af; border:1px solid #bfdbfe;"></div>
+                <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+                <script>
+                // Render each PDF page to a compressed JPEG in the browser and send them to the AI in batches
+                // that stay under the gateway's ~1 MB request limit (works for scanned plans too).
+                const AI_LONG_EDGE = 2000;      // px; keeps small Thai table text legible
+                const AI_MAX_IMAGE_BYTES = 450 * 1024;
+
+                async function aiRenderPage(pdf, n) {
+                    const page = await pdf.getPage(n);
+                    const base = page.getViewport({ scale: 1 });
+                    let scale = AI_LONG_EDGE / Math.max(base.width, base.height);
+                    for (let attempt = 0; attempt < 6; attempt++) {
+                        const viewport = page.getViewport({ scale });
+                        const canvas = document.createElement('canvas');
+                        canvas.width = Math.round(viewport.width);
+                        canvas.height = Math.round(viewport.height);
+                        const ctx = canvas.getContext('2d');
+                        ctx.fillStyle = '#ffffff';
+                        ctx.fillRect(0, 0, canvas.width, canvas.height);
+                        // intent 'print' renders without requestAnimationFrame, so it keeps going when the tab is in the background
+                        await page.render({ canvasContext: ctx, viewport, intent: 'print' }).promise;
+                        for (const quality of [0.8, 0.65, 0.5]) {
+                            const blob = await new Promise(resolve => canvas.toBlob(resolve, 'image/jpeg', quality));
+                            if (blob.size <= AI_MAX_IMAGE_BYTES) return blob;
+                        }
+                        scale *= 0.8;
+                    }
+                    throw new Error('ไม่สามารถย่อภาพหน้า ' + n + ' ให้มีขนาดเหมาะสมได้');
+                }
+
+                async function aiPostJson(data) {
+                    const response = await fetch('admin.php', { method: 'POST', body: data, credentials: 'same-origin' });
+                    const text = await response.text();
+                    try { return JSON.parse(text); } catch (e) { throw new Error(text.replace(/<[^>]*>/g, ' ').trim().slice(0, 300) || ('HTTP ' + response.status)); }
+                }
+
+                function aiExtractPlan(form) {
+                    const button = form.querySelector('button');
+                    const progress = document.getElementById('ai-progress');
+                    const show = (text) => { progress.style.display = 'block'; progress.textContent = text; };
+                    const planId = form.querySelector('input[name=plan_id]').value;
+                    const csrf = form.querySelector('input[name=csrf_token]').value;
+                    const maxBatchBytes = parseInt(form.dataset.maxBatchBytes, 10);
+                    button.disabled = true;
+
+                    (async () => {
+                        try {
+                            // 1) Send the whole PDF (works whenever the file fits the provider's request limit, e.g. Gemini)
+                            show('AI กำลังอ่านไฟล์แผนทั้งไฟล์... (ประมาณ 15-60 วินาที)');
+                            const whole = new FormData();
+                            whole.append('action', 'ai_extract_pdf');
+                            whole.append('csrf_token', csrf);
+                            whole.append('plan_id', planId);
+                            const first = await aiPostJson(whole);
+                            if (first.ok) {
+                                show('อ่านเสร็จแล้ว พบ ' + first.count + ' โครงการ กำลังเปิดหน้าตรวจสอบ...');
+                                window.location.href = 'admin.php?view=ai_review&plan_id=' + planId;
+                                return;
+                            }
+                            if (!first.need_images) throw new Error(first.error);
+
+                            // 2) Too large for one request: render the pages to JPEG and send them in small batches
+                            if (typeof pdfjsLib === 'undefined') throw new Error('ไฟล์มีขนาดใหญ่และไม่สามารถโหลดตัวแปลง PDF (PDF.js) ได้ กรุณาตรวจสอบการเชื่อมต่ออินเทอร์เน็ต');
+                            pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+                            show('ไฟล์มีขนาดใหญ่ กำลังแปลงเป็นภาพทีละหน้า...');
+                            const pdf = await pdfjsLib.getDocument(form.dataset.pdf).promise;
+                            const pages = [];
+                            for (let n = 1; n <= pdf.numPages; n++) {
+                                show('กำลังเตรียมภาพหน้า ' + n + ' / ' + pdf.numPages + ' ...');
+                                pages.push({ n, blob: await aiRenderPage(pdf, n) });
+                            }
+
+                            const batches = [];
+                            let current = [], size = 0;
+                            for (const p of pages) {
+                                if (current.length && size + p.blob.size > maxBatchBytes) { batches.push(current); current = []; size = 0; }
+                                current.push(p); size += p.blob.size;
+                            }
+                            batches.push(current);
+
+                            let found = 0;
+                            for (let b = 0; b < batches.length; b++) {
+                                const batch = batches[b];
+                                const range = batch[0].n + (batch.length > 1 ? '-' + batch[batch.length - 1].n : '');
+                                show('AI กำลังอ่านหน้า ' + range + ' จาก ' + pdf.numPages + ' หน้า (ชุดที่ ' + (b + 1) + '/' + batches.length + ') พบแล้ว ' + found + ' โครงการ...');
+                                const data = new FormData();
+                                data.append('action', 'ai_extract_batch');
+                                data.append('csrf_token', csrf);
+                                data.append('plan_id', planId);
+                                data.append('batch_index', b);
+                                data.append('total_pages', pdf.numPages);
+                                for (const p of batch) {
+                                    data.append('pages[]', p.n);
+                                    data.append('images[]', p.blob, 'page-' + p.n + '.jpg');
+                                }
+                                const json = await aiPostJson(data);
+                                if (!json.ok) throw new Error(json.error);
+                                found += json.count;
+                            }
+                            show('อ่านเสร็จแล้ว พบ ' + found + ' โครงการ กำลังเปิดหน้าตรวจสอบ...');
+                            window.location.href = 'admin.php?view=ai_review&plan_id=' + planId;
+                        } catch (err) {
+                            show('ดึงโครงการด้วย AI ไม่สำเร็จ: ' + err.message);
+                            progress.style.background = '#fef2f2'; progress.style.color = '#b91c1c'; progress.style.borderColor = '#fecaca';
+                            button.disabled = false;
+                        }
+                    })();
+                    return false;
+                }
+                </script>
 
                 <!-- Sub-projects Table -->
                 <section class="card-table-wrap">
@@ -2463,12 +2658,15 @@ $all_projects = $projects_stmt->fetchAll();
                                 งบประมาณรวมที่อ่านได้ <?= number_format($ai_total_budget, 2) ?> บาท &middot;
                                 <a href="<?= htmlspecialchars($plan_info['file_path']) ?>" target="_blank">เปิดไฟล์ PDF ต้นฉบับเพื่อเทียบ</a>
                             </p>
-                            <?php if (!empty($ai_draft['quota']['daily_remaining_tokens'])): ?>
-                                <p style="font-size: 0.8rem; color: var(--text-muted); margin-top: 2px;">
-                                    ใช้ไป <?= number_format(($ai_draft['usage']['input_tokens'] ?? 0) + ($ai_draft['usage']['output_tokens'] ?? 0)) ?> tokens &middot;
-                                    โควตา AI คงเหลือวันนี้ <?= number_format($ai_draft['quota']['daily_remaining_tokens']) ?> / <?= number_format($ai_draft['quota']['daily_quota_tokens'] ?? 0) ?> tokens (ณ เวลาที่ดึงข้อมูล)
-                                </p>
-                            <?php endif; ?>
+                            <p style="font-size: 0.8rem; color: var(--text-muted); margin-top: 2px;">
+                                ใช้ไป <?= number_format(($ai_draft['usage']['input_tokens'] ?? 0) + ($ai_draft['usage']['output_tokens'] ?? 0)) ?> tokens
+                                <?php foreach ($ai_draft['quotas'] ?? [] as $ai_model => $ai_quota): ?>
+                                    &middot; อ่านโดย <strong><?= htmlspecialchars($ai_model) ?></strong>
+                                    <?php if (!empty($ai_quota['daily_quota_tokens'])): ?>
+                                        (โควตาคงเหลือวันนี้ <?= number_format($ai_quota['daily_remaining_tokens'] ?? 0) ?> / <?= number_format($ai_quota['daily_quota_tokens']) ?>)
+                                    <?php endif; ?>
+                                <?php endforeach; ?>
+                            </p>
                         </div>
                     </div>
                     <div class="alert-message" style="margin: 16px 24px 0; background: #fffbeb; color: #92400e; border: 1px solid #fde68a;">
