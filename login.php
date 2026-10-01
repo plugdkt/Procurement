@@ -1,7 +1,8 @@
 <?php
 // login.php - Admin authentication
 require_once 'db.php';
-session_start();
+require_once 'security.php';
+secure_session_start();
 
 // If already logged in, redirect to admin panel
 if (isset($_SESSION['admin_logged_in']) && $_SESSION['admin_logged_in'] === true) {
@@ -29,6 +30,7 @@ if ($_SESSION['lockout_until'] > time()) {
 }
 
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && $_SESSION['lockout_until'] <= time()) {
+    csrf_verify();
     $username = isset($_POST['username']) ? trim($_POST['username']) : '';
     $password = isset($_POST['password']) ? trim($_POST['password']) : '';
 
@@ -105,9 +107,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && $_SESSION['lockout_until'] <= time(
                 $_SESSION['login_attempts'] = 0;
                 $_SESSION['lockout_until'] = 0;
                 
-                // Set session variables
+                // Prevent session fixation, then set session variables
+                session_regenerate_id(true);
                 $_SESSION['admin_logged_in'] = true;
-                $_SESSION['admin_user_id'] = $user['id'];
+                $_SESSION['admin_user_id'] = (int)$user['id'];
                 $_SESSION['admin_username'] = $user['username'];
                 $_SESSION['admin_name'] = $admin_name;
                 $_SESSION['admin_role'] = $user['role'] ?? 'admin';
@@ -161,6 +164,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && $_SESSION['lockout_until'] <= time(
         <?php endif; ?>
 
         <form action="login.php" method="POST">
+            <?= csrf_field() ?>
             <div class="form-group" style="margin-bottom: 20px;">
                 <label for="username">ชื่อผู้ใช้งาน (Username)</label>
                 <input type="text" id="username" name="username" class="form-control" placeholder="พิมพ์ชื่อผู้ใช้งาน..." required autofocus autocomplete="username">

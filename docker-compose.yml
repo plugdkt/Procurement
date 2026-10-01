@@ -1,0 +1,35 @@
+# Local development environment: http://localhost:8088 (override with APP_PORT)
+services:
+  app:
+    build: .
+    ports:
+      - "${APP_PORT:-8088}:80"
+    environment:
+      DB_HOST: db
+      DB_USER: procurement
+      DB_PASS: procurement_dev
+      DB_NAME: procurement_db
+    volumes:
+      - ./:/var/www/html
+    depends_on:
+      db:
+        condition: service_healthy
+
+  db:
+    image: mysql:8.0
+    environment:
+      MYSQL_ROOT_PASSWORD: root_dev
+      MYSQL_DATABASE: procurement_db
+      MYSQL_USER: procurement
+      MYSQL_PASSWORD: procurement_dev
+    command: --character-set-server=utf8mb4 --collation-server=utf8mb4_unicode_ci
+    volumes:
+      - db_data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-uroot", "-proot_dev"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+volumes:
+  db_data:

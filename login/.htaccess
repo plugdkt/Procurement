@@ -1,0 +1,3 @@
+# This folder only provides the NuSOAP library (login/src/nusoap.php) included server-side by ../login.php.
+# Nothing here needs to be reachable from the web.
+Require all denied

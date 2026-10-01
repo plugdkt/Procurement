@@ -1,7 +1,8 @@
 <?php
 // admin.php - Administrative Control Panel (Annual Plans & Projects Management)
 require_once 'db.php';
-session_start();
+require_once 'security.php';
+secure_session_start();
 
 // Authentication Check
 if (!isset($_SESSION['admin_logged_in']) || $_SESSION['admin_logged_in'] !== true) {
@@ -13,6 +14,40 @@ try {
     $pdo = db_connect();
 } catch (Exception $e) {
     die("ฐานข้อมูลเชื่อมต่อไม่ได้");
+}
+
+// Reload the account on every request so role changes / deletions take effect immediately
+$current_user_stmt = $pdo->prepare("SELECT id, username, role, password FROM users WHERE id = ?");
+$current_user_stmt->execute([(int)($_SESSION['admin_user_id'] ?? 0)]);
+$current_user = $current_user_stmt->fetch();
+if (!$current_user) {
+    session_destroy();
+    header('Location: login.php');
+    exit();
+}
+$_SESSION['admin_user_id'] = (int)$current_user['id'];
+$_SESSION['admin_role'] = $current_user['role'] ?: 'admin';
+$admin_role = $_SESSION['admin_role'];
+$using_default_password = uses_default_password($current_user['password']);
+unset($current_user['password']);
+
+// Request guard: CSRF check for every state-changing request, read-only access for executives
+$read_only_get_actions = ['logout', 'get_plan_tracking'];
+$get_action = isset($_GET['action']) ? (string)$_GET['action'] : '';
+$post_action = ($_SERVER['REQUEST_METHOD'] === 'POST') ? (string)($_POST['action'] ?? '') : '';
+$is_write_request = ($_SERVER['REQUEST_METHOD'] === 'POST') || ($get_action !== '' && !in_array($get_action, $read_only_get_actions, true));
+if ($is_write_request) {
+    csrf_verify();
+    $executive_allowed = ($post_action === 'change_password');
+    if ($admin_role === 'executive' && !$executive_allowed) {
+        http_response_code(403);
+        die('สิทธิ์ผู้บริหาร (Executive) สามารถดูรายงานได้อย่างเดียว ไม่สามารถแก้ไขข้อมูลได้');
+    }
+}
+
+// Only a superadmin may create, modify or delete superadmin accounts
+function can_manage_role($actor_role, $target_role) {
+    return $target_role !== 'superadmin' || $actor_role === 'superadmin';
 }
 
 $success_msg = '';
@@ -108,7 +143,7 @@ function get_project_tracking_progress($pdo, $proj) {
     if ($progress_pct > 100) $progress_pct = 100;
     
     $latest_completed_step = '1. แผนการจัดซื้อจัดจ้าง';
-    $latest_completed_date = $proj['plan_date'];
+    $latest_completed_date = $proj['plan_date'] ?? null;
     $current_status_color = 'var(--secondary)';
     
     if ($proj['procurement_method'] === 'เฉพาะเจาะจง') {
@@ -245,7 +280,7 @@ if (isset($_GET['action']) && $_GET['action'] === 'get_plan_tracking') {
         echo '</div>';
     }
 
-    $stmt = $pdo->prepare("SELECT * FROM projects WHERE plan_id = ? ORDER BY id DESC");
+    $stmt = $pdo->prepare("SELECT p.*, pl.announce_date AS plan_date FROM projects p JOIN plans pl ON p.plan_id = pl.id WHERE p.plan_id = ? ORDER BY p.id DESC");
     $stmt->execute([$plan_id]);
     $projs = $stmt->fetchAll();
     
@@ -283,9 +318,14 @@ if (isset($_GET['action']) && $_GET['action'] === 'get_plan_tracking') {
 if (isset($_GET['action']) && $_GET['action'] === 'delete_user') {
     if (!in_array($_SESSION['admin_role'] ?? '', ['superadmin', 'admin'])) die("Permission denied.");
     $user_id = intval($_GET['id']);
-    
+    $target_stmt = $pdo->prepare("SELECT role FROM users WHERE id = ?");
+    $target_stmt->execute([$user_id]);
+    $target_role = $target_stmt->fetchColumn();
+
     if ($user_id === $_SESSION['admin_user_id']) {
         $_SESSION['error_flash'] = 'ไม่สามารถลบบัญชีของตนเองที่กำลังใช้งานอยู่ได้';
+    } elseif ($target_role !== false && !can_manage_role($admin_role, $target_role)) {
+        $_SESSION['error_flash'] = 'เฉพาะ Super Admin เท่านั้นที่สามารถลบบัญชี Super Admin ได้';
     } else {
         $stmt = $pdo->prepare("DELETE FROM users WHERE id = ?");
         $stmt->execute([$user_id]);
@@ -399,6 +439,10 @@ if (isset($_SESSION['success_flash'])) {
     $success_msg = $_SESSION['success_flash'];
     unset($_SESSION['success_flash']);
 }
+if (isset($_SESSION['error_flash'])) {
+    $error_msg = $_SESSION['error_flash'];
+    unset($_SESSION['error_flash']);
+}
 
 // POST actions
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
@@ -414,13 +458,18 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
         
         if ($u_username === '' || $u_name === '' || !in_array($u_role, ['superadmin', 'admin', 'executive'])) {
             $error_msg = 'กรุณากรอกข้อมูลผู้ใช้งานให้ครบถ้วนและถูกต้อง';
+        } elseif (!can_manage_role($admin_role, $u_role)) {
+            $error_msg = 'เฉพาะ Super Admin เท่านั้นที่สามารถสร้างบัญชี Super Admin ได้';
+        } elseif ($u_pass !== '' && mb_strlen($u_pass) < 8) {
+            $error_msg = 'รหัสผ่านต้องมีความยาวอย่างน้อย 8 ตัวอักษร';
         } else {
             $stmt = $pdo->prepare("SELECT COUNT(*) FROM users WHERE username = ?");
             $stmt->execute([$u_username]);
             if ($stmt->fetchColumn() > 0) {
                 $error_msg = 'ชื่อผู้ใช้งาน (Username) นี้มีในระบบแล้ว';
             } else {
-                $hashed = password_hash($u_pass, PASSWORD_DEFAULT);
+                // Blank password = UP Login only; store an unguessable random hash so no local password works
+                $hashed = password_hash($u_pass !== '' ? $u_pass : bin2hex(random_bytes(32)), PASSWORD_DEFAULT);
                 $stmt = $pdo->prepare("INSERT INTO users (username, password, name, role) VALUES (?, ?, ?, ?)");
                 $stmt->execute([$u_username, $hashed, $u_name, $u_role]);
                 $_SESSION['success_flash'] = 'สร้างผู้ใช้งานใหม่เรียบร้อยแล้ว';
@@ -438,8 +487,16 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
         $u_pass = $_POST['password'] ?? ''; // Optional
         $u_role = $_POST['role'] ?? 'admin';
         
-        if ($u_id <= 0 || $u_name === '' || !in_array($u_role, ['superadmin', 'admin', 'executive'])) {
+        $target_stmt = $pdo->prepare("SELECT role FROM users WHERE id = ?");
+        $target_stmt->execute([$u_id]);
+        $target_role = $target_stmt->fetchColumn();
+
+        if ($u_id <= 0 || $target_role === false || $u_name === '' || !in_array($u_role, ['superadmin', 'admin', 'executive'])) {
             $error_msg = 'ข้อมูลไม่ถูกต้อง';
+        } elseif (!can_manage_role($admin_role, $target_role) || !can_manage_role($admin_role, $u_role)) {
+            $error_msg = 'เฉพาะ Super Admin เท่านั้นที่สามารถแก้ไขหรือกำหนดสิทธิ์ Super Admin ได้';
+        } elseif ($u_pass !== '' && mb_strlen($u_pass) < 8) {
+            $error_msg = 'รหัสผ่านต้องมีความยาวอย่างน้อย 8 ตัวอักษร';
         } else {
             if ($u_pass !== '') {
                 $hashed = password_hash($u_pass, PASSWORD_DEFAULT);
@@ -657,9 +714,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
             $error_msg = 'กรุณากรอกข้อมูลรหัสผ่านให้ครบทุกช่อง';
         } elseif ($new_pass !== $confirm_pass) {
             $error_msg = 'รหัสผ่านใหม่และการยืนยันรหัสผ่านไม่ตรงกัน';
+        } elseif (mb_strlen($new_pass) < 8) {
+            $error_msg = 'รหัสผ่านใหม่ต้องมีความยาวอย่างน้อย 8 ตัวอักษร';
+        } elseif (uses_default_password(password_hash($new_pass, PASSWORD_DEFAULT))) {
+            $error_msg = 'ไม่อนุญาตให้ใช้รหัสผ่านเริ่มต้นของระบบ กรุณาตั้งรหัสผ่านใหม่';
         } else {
             try {
-                $stmt = $pdo->prepare("SELECT * stroke FROM users WHERE id = ?"); // Wait, type error, let's select * from users instead of SELECT * stroke
                 $stmt = $pdo->prepare("SELECT * FROM users WHERE id = ?");
                 $stmt->execute([$_SESSION['admin_user_id']]);
                 $user = $stmt->fetch();
@@ -669,6 +729,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
                     $up_stmt = $pdo->prepare("UPDATE users SET password = ? WHERE id = ?");
                     $up_stmt->execute([$new_hashed, $_SESSION['admin_user_id']]);
                     $success_msg = 'เปลี่ยนรหัสผ่านผู้ดูแลระบบสำเร็จเรียบร้อยแล้ว';
+                    $using_default_password = false;
                 } else {
                     $error_msg = 'รหัสผ่านปัจจุบันไม่ถูกต้อง';
                 }
@@ -876,7 +937,7 @@ if ($view_project_id > 0) {
 }
 
 // Fetch all projects for the dashboard listing (Filtered by selected year and optionally plan_id)
-$projects_query = "SELECT p.*, pl.plan_name, pl.fiscal_year, pl.budget_source FROM projects p JOIN plans pl ON p.plan_id = pl.id WHERE 1=1";
+$projects_query = "SELECT p.*, pl.plan_name, pl.fiscal_year, pl.budget_source, pl.announce_date AS plan_date FROM projects p JOIN plans pl ON p.plan_id = pl.id WHERE 1=1";
 $projects_params = [];
 if ($selected_year > 0) {
     $projects_query .= " AND pl.fiscal_year = ?";
@@ -1018,6 +1079,11 @@ $all_projects = $projects_stmt->fetchAll();
             </header>
 
             <!-- Alerts -->
+            <?php if ($using_default_password): ?>
+                <div class="alert-message alert-danger">
+                    บัญชีนี้ยังใช้รหัสผ่านเริ่มต้นของระบบ ซึ่งไม่ปลอดภัย กรุณา <a href="admin.php?view=password" style="font-weight:700; text-decoration:underline;">เปลี่ยนรหัสผ่าน</a> ทันที
+                </div>
+            <?php endif; ?>
             <?php if ($success_msg !== ''): ?>
                 <div class="alert-message alert-success"><?= htmlspecialchars($success_msg) ?></div>
             <?php endif; ?>
@@ -1089,7 +1155,7 @@ $all_projects = $projects_stmt->fetchAll();
                                                             <path d="M3 17.25V21h3.75L17.81 9.94l-3.75-3.75L3 17.25zM20.71 7.04c.39-.39.39-1.02 0-1.41l-2.34-2.34c-.39-.39-1.02-.39-1.41 0l-1.83 1.83 3.75 3.75 1.83-1.83z"/>
                                                         </svg>
                                                     </button>
-                                                    <a href="admin.php?action=delete_plan&id=<?= $plan['id'] ?>" class="btn btn-danger btn-icon-only" title="ลบแผนจัดซื้อและโครงการทั้งหมดในแผน"
+                                                    <a href="admin.php?action=delete_plan&<?= csrf_query() ?>&id=<?= $plan['id'] ?>" class="btn btn-danger btn-icon-only" title="ลบแผนจัดซื้อและโครงการทั้งหมดในแผน"
                                                        onclick="return confirm('คำเตือน! การลบแผนงานนี้จะลบโครงการย่อยทั้งหมดและประกาศย่อยภายใต้โครงการจัดซื้อนั้นออกจากฐานข้อมูลรวมถึงไฟล์ PDF บนเซิร์ฟเวอร์ด้วย แน่ใจใช่หรือไม่?')">
                                                         <svg style="width:16px;height:16px;fill:currentColor;" viewBox="0 0 24 24">
                                                             <path d="M6 19c0 1.1.9 2 2 2h8c1.1 0 2-.9 2-2V7H6v12zM19 4h-3.5l-1-1h-5l-1 1H5v2h14V4z"/>
@@ -1203,7 +1269,7 @@ $all_projects = $projects_stmt->fetchAll();
                                                             <path d="M3 17.25V21h3.75L17.81 9.94l-3.75-3.75L3 17.25zM20.71 7.04c.39-.39.39-1.02 0-1.41l-2.34-2.34c-.39-.39-1.02-.39-1.41 0l-1.83 1.83 3.75 3.75 1.83-1.83z"/>
                                                         </svg>
                                                     </button>
-                                                    <a href="admin.php?action=delete_project&id=<?= $sp['id'] ?>&ref=plan_detail&plan_id=<?= $plan_info['id'] ?>" class="btn btn-danger btn-icon-only" title="ลบโครงการนี้"
+                                                    <a href="admin.php?action=delete_project&<?= csrf_query() ?>&id=<?= $sp['id'] ?>&ref=plan_detail&plan_id=<?= $plan_info['id'] ?>" class="btn btn-danger btn-icon-only" title="ลบโครงการนี้"
                                                        onclick="return confirm('คุณแน่ใจว่าต้องการลบโครงการจัดซื้อนี้และเอกสารประกาศประกอบทั้งหมด? ไฟล์ PDF บนเซิร์ฟเวอร์จะถูกลบออกทั้งหมดจริง')">
                                                         <svg style="width:14px;height:14px;fill:currentColor;" viewBox="0 0 24 24">
                                                             <path d="M6 19c0 1.1.9 2 2 2h8c1.1 0 2-.9 2-2V7H6v12zM19 4h-3.5l-1-1h-5l-1 1H5v2h14V4z"/>
@@ -1299,7 +1365,7 @@ $all_projects = $projects_stmt->fetchAll();
                                                         </svg>
                                                         แก้ไขข้อมูล
                                                     </button>
-                                                    <a href="admin.php?action=delete_project&id=<?= $proj['id'] ?>" class="btn btn-danger btn-icon-only" title="ลบโครงการนี้"
+                                                    <a href="admin.php?action=delete_project&<?= csrf_query() ?>&id=<?= $proj['id'] ?>" class="btn btn-danger btn-icon-only" title="ลบโครงการนี้"
                                                        onclick="return confirm('คุณแน่ใจว่าต้องการลบโครงการจัดซื้อนี้และเอกสารประกาศประกอบทั้งหมด? ไฟล์ PDF บนเซิร์ฟเวอร์จะถูกลบออกทั้งหมดจริง')">
                                                         <svg style="width:16px;height:16px;fill:currentColor;" viewBox="0 0 24 24">
                                                             <path d="M6 19c0 1.1.9 2 2 2h8c1.1 0 2-.9 2-2V7H6v12zM19 4h-3.5l-1-1h-5l-1 1H5v2h14V4z"/>
@@ -1434,6 +1500,7 @@ $all_projects = $projects_stmt->fetchAll();
                         </div>
                         <form action="admin.php?view_project=<?= $view_project_id ?>" method="POST" enctype="multipart/form-data" style="padding: 24px; display: flex; flex-direction: column; gap: 16px;">
                             <input type="hidden" name="action" value="add_announcement">
+                            <?= csrf_field() ?>
                             <input type="hidden" name="project_id" value="<?= $view_project_id ?>">
                             
                             <div class="form-group">
@@ -1504,7 +1571,7 @@ $all_projects = $projects_stmt->fetchAll();
                                                 <span class="doc-step-indicator <?= $badge_class ?>" style="font-size:0.7rem; font-weight:700; padding: 4px 8px; border-radius:4px;">
                                                     ขั้นตอนที่ <?= $ann['category_id'] ?>: <?= get_category_name($ann['category_id']) ?>
                                                 </span>
-                                                <a href="admin.php?action=delete_announcement&id=<?= $ann['id'] ?>&project_id=<?= $view_project_id ?>" class="btn btn-danger btn-icon-only" style="padding:4px;" title="ลบประกาศขั้นตอนนี้"
+                                                <a href="admin.php?action=delete_announcement&<?= csrf_query() ?>&id=<?= $ann['id'] ?>&project_id=<?= $view_project_id ?>" class="btn btn-danger btn-icon-only" style="padding:4px;" title="ลบประกาศขั้นตอนนี้"
                                                    onclick="return confirm('คุณแน่ใจว่าต้องการลบเอกสารประกาศนี้ใช่หรือไม่? ไฟล์ที่อยู่ในระบบจะถูกลบจริงทันที')">
                                                     <svg style="width:16px;height:16px;fill:currentColor;" viewBox="0 0 24 24">
                                                         <path d="M6 19c0 1.1.9 2 2 2h8c1.1 0 2-.9 2-2V7H6v12zM19 4h-3.5l-1-1h-5l-1 1H5v2h14V4z"/>
@@ -1804,6 +1871,7 @@ $all_projects = $projects_stmt->fetchAll();
 
                 <form action="admin.php" method="POST">
                     <input type="hidden" name="action" value="update_tracking">
+                    <?= csrf_field() ?>
                     <input type="hidden" name="project_id" value="<?= $proj_id ?>">
                     
                     <section class="card-table-wrap" style="margin-bottom: 30px;">
@@ -1892,7 +1960,7 @@ $all_projects = $projects_stmt->fetchAll();
                                                     <option value="completed" <?= $c['contract_status'] === 'completed' ? 'selected' : '' ?>>ทำสัญญาแล้ว</option>
                                                 </select>
                                                 <input type="date" name="contract_date[<?= $c['id'] ?>]" class="form-control" style="width:130px; font-size:0.8rem; padding:4px;" value="<?= htmlspecialchars($c['contract_date'] ?? '') ?>">
-                                                <a href="admin.php?action=delete_contract&id=<?= $c['id'] ?>&project_id=<?= $proj_id ?>" class="btn btn-danger btn-icon-only" style="padding:2px 6px; font-size:0.75rem;" onclick="return confirm('ยืนยันลบรายชื่อบริษัทนี้?')">ลบ</a>
+                                                <a href="admin.php?action=delete_contract&<?= csrf_query() ?>&id=<?= $c['id'] ?>&project_id=<?= $proj_id ?>" class="btn btn-danger btn-icon-only" style="padding:2px 6px; font-size:0.75rem;" onclick="return confirm('ยืนยันลบรายชื่อบริษัทนี้?')">ลบ</a>
                                             </div>
                                         <?php endforeach; ?>
                                     </div>
@@ -2024,7 +2092,7 @@ $all_projects = $projects_stmt->fetchAll();
                                                 <option value="completed" <?= $c['contract_status'] === 'completed' ? 'selected' : '' ?>>ทำสัญญาแล้ว</option>
                                             </select>
                                             <input type="date" name="contract_date[<?= $c['id'] ?>]" class="form-control" style="width:130px; font-size:0.8rem; padding:4px;" value="<?= htmlspecialchars($c['contract_date'] ?? '') ?>">
-                                            <a href="admin.php?action=delete_contract&id=<?= $c['id'] ?>&project_id=<?= $proj_id ?>" class="btn btn-danger btn-icon-only" style="padding:2px 6px; font-size:0.75rem;" onclick="return confirm('ยืนยันลบรายชื่อบริษัทนี้?')">ลบ</a>
+                                            <a href="admin.php?action=delete_contract&<?= csrf_query() ?>&id=<?= $c['id'] ?>&project_id=<?= $proj_id ?>" class="btn btn-danger btn-icon-only" style="padding:2px 6px; font-size:0.75rem;" onclick="return confirm('ยืนยันลบรายชื่อบริษัทนี้?')">ลบ</a>
                                         </div>
                                     <?php endforeach; ?>
                                 </div>
@@ -2089,6 +2157,7 @@ $all_projects = $projects_stmt->fetchAll();
                                 <div style="padding: 16px; background:#fafbfd; border-bottom: 1px solid #eee;">
                                     <form action="admin.php" method="POST" style="display:flex; gap:16px; align-items:flex-end;">
                                         <input type="hidden" name="action" value="add_installment">
+                                        <?= csrf_field() ?>
                                         <input type="hidden" name="project_id" value="<?= $proj_id ?>">
                                         <input type="hidden" name="contract_id" value="<?= $c['id'] ?>">
                                         <div class="form-group" style="margin:0; width: 300px;">
@@ -2108,12 +2177,13 @@ $all_projects = $projects_stmt->fetchAll();
                                                     <h4 style="font-size:1.05rem; font-weight:600; color:var(--primary-dark); margin:0;">
                                                         <?= htmlspecialchars($inst['installment_name']) ?>
                                                     </h4>
-                                                    <a href="admin.php?action=delete_installment&id=<?= $inst['id'] ?>&project_id=<?= $proj_id ?>" 
+                                                    <a href="admin.php?action=delete_installment&<?= csrf_query() ?>&id=<?= $inst['id'] ?>&project_id=<?= $proj_id ?>" 
                                                        class="btn btn-danger btn-icon-only" style="padding:4px 8px;"
                                                        onclick="return confirm('ยืนยันการลบงวดงานนี้?')">ลบ</a>
                                                 </div>
                                                 <form action="admin.php" method="POST">
                                                     <input type="hidden" name="action" value="update_installment">
+                                                    <?= csrf_field() ?>
                                                     <input type="hidden" name="project_id" value="<?= $proj_id ?>">
                                                     <input type="hidden" name="installment_id" value="<?= $inst['id'] ?>">
                                                     <div style="display:grid; grid-template-columns:1fr 1fr 1fr; gap:20px;">
@@ -2168,12 +2238,13 @@ $all_projects = $projects_stmt->fetchAll();
                                                 <h4 style="font-size:1.05rem; font-weight:600; color:var(--primary-dark); margin:0;">
                                                     <?= htmlspecialchars($inst['installment_name']) ?>
                                                 </h4>
-                                                <a href="admin.php?action=delete_installment&id=<?= $inst['id'] ?>&project_id=<?= $proj_id ?>" 
+                                                <a href="admin.php?action=delete_installment&<?= csrf_query() ?>&id=<?= $inst['id'] ?>&project_id=<?= $proj_id ?>" 
                                                    class="btn btn-danger btn-icon-only" style="padding:4px 8px;"
                                                    onclick="return confirm('ยืนยันการลบงวดงานนี้?')">ลบ</a>
                                             </div>
                                             <form action="admin.php" method="POST">
                                                 <input type="hidden" name="action" value="update_installment">
+                                                <?= csrf_field() ?>
                                                 <input type="hidden" name="project_id" value="<?= $proj_id ?>">
                                                 <input type="hidden" name="installment_id" value="<?= $inst['id'] ?>">
                                                 <div style="display:grid; grid-template-columns:1fr 1fr 1fr; gap:20px;">
@@ -2217,6 +2288,7 @@ $all_projects = $projects_stmt->fetchAll();
                 <!-- Hidden form for contract management -->
                 <form id="contract_action_form" action="admin.php" method="POST" style="display:none;">
                     <input type="hidden" name="action" id="ca_action" value="">
+                    <?= csrf_field() ?>
                     <input type="hidden" name="project_id" value="<?= $proj_id ?>">
                     <input type="hidden" name="company_name" id="ca_company_name" value="">
                 </form>
@@ -2239,6 +2311,7 @@ $all_projects = $projects_stmt->fetchAll();
                     </div>
                     <form action="admin.php?view=password" method="POST" style="padding: 24px; display: flex; flex-direction: column; gap: 16px;">
                         <input type="hidden" name="action" value="change_password">
+                        <?= csrf_field() ?>
                         
                         <div class="form-group">
                             <label for="old_password">รหัสผ่านปัจจุบัน</label>
@@ -2270,7 +2343,7 @@ $all_projects = $projects_stmt->fetchAll();
                 $plans = $stmt->fetchAll();
                 
                 // Fetch all projects for this fiscal year with their plan information
-                $stmt = $pdo->prepare("SELECT p.*, pl.plan_name, pl.fiscal_year FROM projects p JOIN plans pl ON p.plan_id = pl.id WHERE pl.fiscal_year = ?");
+                $stmt = $pdo->prepare("SELECT p.*, pl.plan_name, pl.fiscal_year, pl.announce_date AS plan_date FROM projects p JOIN plans pl ON p.plan_id = pl.id WHERE pl.fiscal_year = ?");
                 $stmt->execute([$selected_year_param]);
                 $projects = $stmt->fetchAll();
                 
@@ -2399,9 +2472,9 @@ $all_projects = $projects_stmt->fetchAll();
                         new Chart(methodCtx, {
                             type: 'pie',
                             data: {
-                                labels: <?= json_encode($method_labels) ?>,
+                                labels: <?= json_encode($method_labels, JSON_HEX_TAG | JSON_HEX_AMP | JSON_UNESCAPED_UNICODE) ?>,
                                 datasets: [{
-                                    data: <?= json_encode($method_data) ?>,
+                                    data: <?= json_encode($method_data, JSON_HEX_TAG | JSON_HEX_AMP | JSON_UNESCAPED_UNICODE) ?>,
                                     backgroundColor: ['#5d2d91', '#bca256', '#e2e8f0', '#94a3b8'],
                                 }]
                             },
@@ -2412,10 +2485,10 @@ $all_projects = $projects_stmt->fetchAll();
                         new Chart(statusCtx, {
                             type: 'bar',
                             data: {
-                                labels: <?= json_encode($status_labels) ?>,
+                                labels: <?= json_encode($status_labels, JSON_HEX_TAG | JSON_HEX_AMP | JSON_UNESCAPED_UNICODE) ?>,
                                 datasets: [{
                                     label: 'จำนวนโครงการ',
-                                    data: <?= json_encode($status_data) ?>,
+                                    data: <?= json_encode($status_data, JSON_HEX_TAG | JSON_HEX_AMP | JSON_UNESCAPED_UNICODE) ?>,
                                     backgroundColor: '#bca256',
                                     borderRadius: 4
                                 }]
@@ -2540,9 +2613,13 @@ $all_projects = $projects_stmt->fetchAll();
                                         <?php endif; ?>
                                     </td>
                                     <td style="text-align: center;">
+                                        <?php if (can_manage_role($admin_role, $u['role'])): ?>
                                         <button class="btn btn-secondary" style="padding: 4px 10px; font-size: 0.8rem;" onclick="openEditUser(<?= $u['id'] ?>, '<?= htmlspecialchars(addslashes($u['name'])) ?>', '<?= $u['role'] ?>')">แก้ไข</button>
-                                        <?php if ($u['id'] !== $_SESSION['admin_user_id']): ?>
-                                            <a href="admin.php?action=delete_user&id=<?= $u['id'] ?>" class="btn" style="background: #ef4444; color: white; padding: 4px 10px; font-size: 0.8rem;" onclick="return confirm('ยืนยันการลบผู้ใช้งานรายนี้?');">ลบ</a>
+                                        <?php if ((int)$u['id'] !== $_SESSION['admin_user_id']): ?>
+                                            <a href="admin.php?action=delete_user&<?= csrf_query() ?>&id=<?= $u['id'] ?>" class="btn" style="background: #ef4444; color: white; padding: 4px 10px; font-size: 0.8rem;" onclick="return confirm('ยืนยันการลบผู้ใช้งานรายนี้?');">ลบ</a>
+                                        <?php endif; ?>
+                                        <?php else: ?>
+                                            <span style="font-size: 0.8rem; color: var(--text-muted);">-</span>
                                         <?php endif; ?>
                                     </td>
                                 </tr>
@@ -2565,6 +2642,7 @@ $all_projects = $projects_stmt->fetchAll();
         <div class="modal-content">
             <form action="admin.php?view=<?= htmlspecialchars($view) ?><?= isset($_GET['id']) ? '&id=' . intval($_GET['id']) : '' ?>" method="POST" enctype="multipart/form-data">
                 <input type="hidden" name="action" value="create_plan">
+                <?= csrf_field() ?>
                 <div class="modal-header">
                     <h3>เพิ่มแผนการจัดซื้อจัดจ้างประจำปีใหม่</h3>
                     <button type="button" class="modal-close" onclick="closeModal('add-plan-modal')">&times;</button>
@@ -2606,6 +2684,7 @@ $all_projects = $projects_stmt->fetchAll();
         <div class="modal-content">
             <form action="admin.php?view=<?= htmlspecialchars($view) ?><?= isset($_GET['id']) ? '&id=' . intval($_GET['id']) : '' ?>" method="POST" enctype="multipart/form-data">
                 <input type="hidden" name="action" value="edit_plan">
+                <?= csrf_field() ?>
                 <input type="hidden" id="edit_plan_modal_id" name="plan_id">
                 <div class="modal-header">
                     <h3>แก้ไขข้อมูลแผนการจัดซื้อจัดจ้าง</h3>
@@ -2648,6 +2727,7 @@ $all_projects = $projects_stmt->fetchAll();
         <div class="modal-content">
             <form action="admin.php?view=<?= htmlspecialchars($view) ?><?= isset($_GET['id']) ? '&id=' . intval($_GET['id']) : '' ?>" method="POST">
                 <input type="hidden" name="action" value="create_project">
+                <?= csrf_field() ?>
                 <div class="modal-header">
                     <h3>สร้างโครงการจัดซื้อจัดจ้างใหม่</h3>
                     <button type="button" class="modal-close" onclick="closeModal('add-project-modal')">&times;</button>
@@ -2729,6 +2809,7 @@ $all_projects = $projects_stmt->fetchAll();
         <div class="modal-content">
             <form action="admin.php?view=<?= htmlspecialchars($view) ?><?= isset($_GET['id']) ? '&id=' . intval($_GET['id']) : '' ?>" method="POST">
                 <input type="hidden" name="action" value="edit_project">
+                <?= csrf_field() ?>
                 <input type="hidden" id="edit_project_id" name="project_id">
                 <div class="modal-header">
                     <h3>แก้ไขรายละเอียดโครงการจัดซื้อ</h3>
@@ -2874,6 +2955,7 @@ $all_projects = $projects_stmt->fetchAll();
             </div>
             <form action="admin.php" method="POST" style="padding: 24px;">
                 <input type="hidden" name="action" value="create_user">
+                <?= csrf_field() ?>
                 <div class="form-group">
                     <label>ชื่อผู้ใช้งาน (Username) สำหรับเข้าสู่ระบบ</label>
                     <input type="text" name="username" class="form-control" required>
@@ -2891,7 +2973,9 @@ $all_projects = $projects_stmt->fetchAll();
                     <select name="role" class="form-control" required>
                         <option value="admin">Admin (เจ้าหน้าที่พัสดุ - จัดการโครงการ)</option>
                         <option value="executive">Executive (ผู้บริหาร - ดูรายงาน)</option>
-                        <option value="superadmin">Super Admin (ผู้ดูแลระบบสูงสุด)</option>
+                        <?php if ($admin_role === 'superadmin'): ?>
+                            <option value="superadmin">Super Admin (ผู้ดูแลระบบสูงสุด)</option>
+                        <?php endif; ?>
                     </select>
                 </div>
                 <div class="modal-footer">
@@ -2911,6 +2995,7 @@ $all_projects = $projects_stmt->fetchAll();
             </div>
             <form action="admin.php" method="POST" style="padding: 24px;">
                 <input type="hidden" name="action" value="edit_user">
+                <?= csrf_field() ?>
                 <input type="hidden" name="user_id" id="edit_user_id">
                 <div class="form-group">
                     <label>ชื่อ-นามสกุล หรือ ตำแหน่ง</label>
@@ -2921,7 +3006,9 @@ $all_projects = $projects_stmt->fetchAll();
                     <select name="role" id="edit_user_role" class="form-control" required>
                         <option value="admin">Admin (เจ้าหน้าที่พัสดุ - จัดการโครงการ)</option>
                         <option value="executive">Executive (ผู้บริหาร - ดูรายงาน)</option>
-                        <option value="superadmin">Super Admin (ผู้ดูแลระบบสูงสุด)</option>
+                        <?php if ($admin_role === 'superadmin'): ?>
+                            <option value="superadmin">Super Admin (ผู้ดูแลระบบสูงสุด)</option>
+                        <?php endif; ?>
                     </select>
                 </div>
                 <div class="form-group" style="margin-top: 20px; border-top: 1px dashed var(--border-color); padding-top: 16px;">
