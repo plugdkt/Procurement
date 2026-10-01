@@ -11,6 +11,7 @@ login/authenticate.php
 /uploads/*
 !/uploads/.gitkeep
 !/uploads/web.config
+!/uploads/.htaccess
 
 # Logs, databases, and temporary files
 *.log

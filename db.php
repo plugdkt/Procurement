@@ -10,6 +10,20 @@ if (!defined('DB_HOST')) define('DB_HOST', getenv('DB_HOST') ?: 'localhost');
 if (!defined('DB_USER')) define('DB_USER', getenv('DB_USER') ?: 'root');
 if (!defined('DB_PASS')) define('DB_PASS', getenv('DB_PASS') ?: '');
 if (!defined('DB_NAME')) define('DB_NAME', getenv('DB_NAME') ?: 'procurement_db');
+if (!defined('ADMIN_INITIAL_PASSWORD')) define('ADMIN_INITIAL_PASSWORD', getenv('ADMIN_INITIAL_PASSWORD') ?: 'admin1234');
+
+// Accounts seeded by earlier versions used these well-known passwords
+const KNOWN_DEFAULT_PASSWORDS = ['admin1234', 'exec1234', 'super1234'];
+
+// True when the user's password is still one of the well-known default passwords
+function uses_default_password($password_hash) {
+    foreach (array_unique(array_merge(KNOWN_DEFAULT_PASSWORDS, [ADMIN_INITIAL_PASSWORD])) as $default) {
+        if (password_verify($default, $password_hash)) {
+            return true;
+        }
+    }
+    return false;
+}
 
 function db_connect() {
     static $pdo = null;
@@ -27,7 +41,11 @@ function db_connect() {
         ];
         
         $temp_pdo = new PDO($dsn, DB_USER, DB_PASS, $options);
-        $temp_pdo->exec("CREATE DATABASE IF NOT EXISTS `" . DB_NAME . "` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci");
+        try {
+            $temp_pdo->exec("CREATE DATABASE IF NOT EXISTS `" . DB_NAME . "` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci");
+        } catch (PDOException $e) {
+            // DB user may lack CREATE privilege; the database must then already exist
+        }
         
         // Connect to the actual database
         $pdo = new PDO("mysql:host=" . DB_HOST . ";dbname=" . DB_NAME . ";charset=utf8mb4", DB_USER, DB_PASS, $options);
@@ -37,7 +55,8 @@ function db_connect() {
         
         return $pdo;
     } catch (PDOException $e) {
-        die("Connection failed: " . $e->getMessage());
+        error_log('Procurement DB error: ' . $e->getMessage());
+        die("ระบบไม่สามารถเชื่อมต่อฐานข้อมูลได้ กรุณาติดต่อผู้ดูแลระบบ");
     }
 }
 
@@ -108,30 +127,12 @@ function db_initialize($pdo) {
         FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci");
     
-    // 5. Create default admin if not exists (username: admin, password: change_me_first_1234)
-    $stmt = $pdo->prepare("SELECT COUNT(*) FROM users WHERE username = 'admin'");
-    $stmt->execute();
-    if ($stmt->fetchColumn() == 0) {
-        $hashed_pass = password_hash('admin1234', PASSWORD_DEFAULT);
-        $stmt = $pdo->prepare("INSERT INTO users (username, password, name, role) VALUES ('admin', ?, 'ผู้ดูแลระบบ', 'admin')");
-        $stmt->execute([$hashed_pass]);
-    }
-    
-    // Create default executive if not exists (username: executive, password: exec1234)
-    $stmt = $pdo->prepare("SELECT COUNT(*) FROM users WHERE username = 'executive'");
-    $stmt->execute();
-    if ($stmt->fetchColumn() == 0) {
-        $hashed_pass = password_hash('exec1234', PASSWORD_DEFAULT);
-        $stmt = $pdo->prepare("INSERT INTO users (username, password, name, role) VALUES ('executive', ?, 'ผู้บริหาร', 'executive')");
-        $stmt->execute([$hashed_pass]);
-    }
-    
-    // Create default superadmin if not exists (username: superadmin, password: super1234)
-    $stmt = $pdo->prepare("SELECT COUNT(*) FROM users WHERE username = 'superadmin'");
-    $stmt->execute();
-    if ($stmt->fetchColumn() == 0) {
-        $hashed_pass = password_hash('super1234', PASSWORD_DEFAULT);
-        $stmt = $pdo->prepare("INSERT INTO users (username, password, name, role) VALUES ('superadmin', ?, 'ผู้ดูแลระบบสูงสุด', 'superadmin')");
+    // 5. Seed an initial superadmin only when the users table is empty.
+    //    Set ADMIN_INITIAL_PASSWORD in config.php / environment; the admin panel warns while the default is in use.
+    $user_count = (int)$pdo->query("SELECT COUNT(*) FROM users")->fetchColumn();
+    if ($user_count === 0) {
+        $hashed_pass = password_hash(ADMIN_INITIAL_PASSWORD, PASSWORD_DEFAULT);
+        $stmt = $pdo->prepare("INSERT INTO users (username, password, name, role) VALUES ('admin', ?, 'ผู้ดูแลระบบสูงสุด', 'superadmin')");
         $stmt->execute([$hashed_pass]);
     }
 
@@ -168,7 +169,18 @@ function db_initialize($pdo) {
         // Columns might already exist, ignore error
     }
 
-    // 7. Create project_installments table (1-to-many with projects for step 8 - Delivery/Inspection/Payment)
+    // 7. Create project_contracts table (1-to-many with projects for contract signing step; must exist before project_installments)
+    $pdo->exec("CREATE TABLE IF NOT EXISTS project_contracts (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        project_id INT NOT NULL,
+        company_name VARCHAR(255) NOT NULL,
+        contract_status VARCHAR(50) DEFAULT 'pending',
+        contract_date DATE NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci");
+
+    // 8. Create project_installments table (1-to-many with projects for step 8 - Delivery/Inspection/Payment)
     $pdo->exec("CREATE TABLE IF NOT EXISTS project_installments (
         id INT AUTO_INCREMENT PRIMARY KEY,
         project_id INT NOT NULL,
@@ -183,17 +195,6 @@ function db_initialize($pdo) {
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE,
         FOREIGN KEY (contract_id) REFERENCES project_contracts(id) ON DELETE CASCADE
-    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci");
-
-    // 8. Create project_contracts table (1-to-many with projects for contract signing step)
-    $pdo->exec("CREATE TABLE IF NOT EXISTS project_contracts (
-        id INT AUTO_INCREMENT PRIMARY KEY,
-        project_id INT NOT NULL,
-        company_name VARCHAR(255) NOT NULL,
-        contract_status VARCHAR(50) DEFAULT 'pending',
-        contract_date DATE NULL,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci");
 }
 

@@ -260,7 +260,7 @@ $plans = $plan_stmt->fetchAll();
                         </div>
                     <?php endforeach; ?>
                 </div>
-                <?php if (count($plans) > 5): ?>
+                <?php if (count($plans) > count($recent_plans)): ?>
                 <div style="text-align: center; margin-top: 24px;">
                     <a href="all_plans.php" class="btn btn-secondary" style="border-radius: 50px; padding: 10px 24px; font-weight: 600; font-size: 0.95rem;">
                         ดูแผนการจัดซื้อจัดจ้างทั้งหมด (<?= count($plans) ?> แผน) &rarr;

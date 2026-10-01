@@ -1,0 +1,6 @@
+# Apache: never execute scripts from the uploads folder (IIS equivalent: web.config)
+<FilesMatch "\.(php|phtml|phar|php\d|pl|py|cgi|asp|aspx|exe|sh)$">
+    Require all denied
+</FilesMatch>
+Options -Indexes -ExecCGI
+php_flag engine off
