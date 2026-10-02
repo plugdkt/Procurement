@@ -176,9 +176,21 @@ function db_initialize($pdo) {
         company_name VARCHAR(255) NOT NULL,
         contract_status VARCHAR(50) DEFAULT 'pending',
         contract_date DATE NULL,
+        contract_no VARCHAR(100) NULL,
+        book_no_mhesi VARCHAR(100) NULL,
+        note TEXT NULL,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci");
+
+    try {
+        $pdo->exec("ALTER TABLE project_contracts 
+            ADD COLUMN contract_no VARCHAR(100) NULL,
+            ADD COLUMN book_no_mhesi VARCHAR(100) NULL,
+            ADD COLUMN note TEXT NULL");
+    } catch (PDOException $e) {
+        // Columns might already exist, ignore error
+    }
 
     // 8. Create project_installments table (1-to-many with projects for step 8 - Delivery/Inspection/Payment)
     $pdo->exec("CREATE TABLE IF NOT EXISTS project_installments (
