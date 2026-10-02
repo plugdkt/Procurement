@@ -88,13 +88,16 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && $_SESSION['lockout_until'] <= time(
                         
                         $staff_info = $response_staff['GetStaffInfoResult'] ?? null;
                         
-                        if ($staff_info && isset($staff_info['Faculty']) && $staff_info['Faculty'] === 'คณะวิทยาศาสตร์การแพทย์') {
-                            if ($user) { // Must exist in our local system (Option 1)
-                                $auth_success = true;
-                                $admin_name = $staff_info['Title'] . $staff_info['FirstName_TH'] . ' ' . $staff_info['LastName_TH'];
+                        if ($user) {
+                            // User is explicitly registered/whitelisted in our local users table by admin
+                            $auth_success = true;
+                            if ($staff_info && !empty($staff_info['FirstName_TH'])) {
+                                $admin_name = ($staff_info['Title'] ?? '') . $staff_info['FirstName_TH'] . ' ' . ($staff_info['LastName_TH'] ?? '');
                             } else {
-                                $error = "คุณยังไม่ได้รับสิทธิ์ให้เข้าใช้งานระบบหลังบ้าน กรุณาติดต่อผู้ดูแลระบบ";
+                                $admin_name = $user['name'];
                             }
+                        } else if ($staff_info && isset($staff_info['Faculty']) && mb_strpos($staff_info['Faculty'], 'วิทยาศาสตร์การแพทย์') !== false) {
+                            $error = "คุณยังไม่ได้รับสิทธิ์ให้เข้าใช้งานระบบหลังบ้าน กรุณาติดต่อผู้ดูแลระบบเพื่อเปิดสิทธิ์การใช้งาน";
                         } else {
                             $error = "สงวนสิทธิ์เฉพาะบุคลากรคณะวิทยาศาสตร์การแพทย์เท่านั้น";
                         }
