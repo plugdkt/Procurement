@@ -177,6 +177,7 @@ function db_initialize($pdo) {
         contract_status VARCHAR(50) DEFAULT 'pending',
         contract_date DATE NULL,
         contract_no VARCHAR(100) NULL,
+        contract_amount DECIMAL(15,2) NULL,
         book_no_mhesi VARCHAR(100) NULL,
         note TEXT NULL,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -186,6 +187,7 @@ function db_initialize($pdo) {
     try {
         $pdo->exec("ALTER TABLE project_contracts 
             ADD COLUMN contract_no VARCHAR(100) NULL,
+            ADD COLUMN contract_amount DECIMAL(15,2) NULL,
             ADD COLUMN book_no_mhesi VARCHAR(100) NULL,
             ADD COLUMN note TEXT NULL");
     } catch (PDOException $e) {

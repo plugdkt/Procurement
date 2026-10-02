@@ -799,13 +799,14 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
         
         // Update multiple contracts status and details
         if (isset($_POST['contract_status']) && is_array($_POST['contract_status'])) {
-            $upd_c = $pdo->prepare("UPDATE project_contracts SET contract_status=?, contract_date=?, contract_no=?, book_no_mhesi=?, note=? WHERE id=? AND project_id=?");
+            $upd_c = $pdo->prepare("UPDATE project_contracts SET contract_status=?, contract_date=?, contract_no=?, contract_amount=?, note=? WHERE id=? AND project_id=?");
             foreach ($_POST['contract_status'] as $cid => $cstatus) {
                 $cdate = !empty($_POST['contract_date'][$cid]) ? $_POST['contract_date'][$cid] : null;
                 $cno = isset($_POST['contract_no'][$cid]) ? trim($_POST['contract_no'][$cid]) : null;
-                $cbook = isset($_POST['book_no_mhesi'][$cid]) ? trim($_POST['book_no_mhesi'][$cid]) : null;
+                $camount_raw = isset($_POST['contract_amount'][$cid]) ? str_replace(',', '', trim($_POST['contract_amount'][$cid])) : '';
+                $camount = is_numeric($camount_raw) ? floatval($camount_raw) : null;
                 $cnote = isset($_POST['contract_note'][$cid]) ? trim($_POST['contract_note'][$cid]) : null;
-                $upd_c->execute([$cstatus, $cdate, $cno, $cbook, $cnote, $cid, $project_id]);
+                $upd_c->execute([$cstatus, $cdate, $cno, $camount, $cnote, $cid, $project_id]);
             }
         }
         
@@ -855,12 +856,14 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
         $project_id = intval($_POST['project_id'] ?? 0);
         $name = trim($_POST['company_name'] ?? '');
         $cno = trim($_POST['contract_no'] ?? '');
-        $cbook = trim($_POST['book_no_mhesi'] ?? '');
+        $cdate = !empty($_POST['contract_date']) ? $_POST['contract_date'] : null;
+        $camount_raw = isset($_POST['contract_amount']) ? str_replace(',', '', trim($_POST['contract_amount'])) : '';
+        $camount = is_numeric($camount_raw) ? floatval($camount_raw) : null;
         $cnote = trim($_POST['note'] ?? '');
         
         if ($project_id > 0 && $name !== '') {
-            $stmt = $pdo->prepare("INSERT INTO project_contracts (project_id, company_name, contract_no, book_no_mhesi, note) VALUES (?, ?, ?, ?, ?)");
-            $stmt->execute([$project_id, $name, $cno ?: null, $cbook ?: null, $cnote ?: null]);
+            $stmt = $pdo->prepare("INSERT INTO project_contracts (project_id, company_name, contract_date, contract_no, contract_amount, note) VALUES (?, ?, ?, ?, ?, ?)");
+            $stmt->execute([$project_id, $name, $cdate, $cno ?: null, $camount, $cnote ?: null]);
             $_SESSION['success_flash'] = 'เพิ่มบริษัทผู้ชนะสำเร็จแล้ว';
         } else {
             $_SESSION['error_flash'] = 'กรุณากรอกชื่อบริษัท / ผู้รับจ้าง';
@@ -2301,7 +2304,7 @@ $all_projects = $projects_stmt->fetchAll();
                                     <!-- Add Contract Form -->
                                     <div style="margin-left:32px; margin-bottom:16px; background:#f8fafc; padding:16px; border-radius:8px; border:1px solid #e2e8f0;">
                                         <div style="font-size:0.9rem; font-weight:700; margin-bottom:12px; color:var(--primary-dark);">+ เพิ่มบริษัทผู้ชนะ / ข้อมูลสัญญา</div>
-                                        <div style="display:grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap:12px; margin-bottom:12px;">
+                                        <div style="display:grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap:12px; margin-bottom:12px;">
                                             <div>
                                                 <label style="font-size:0.8rem; font-weight:600; color:#475569; display:block; margin-bottom:4px;">ชื่อบริษัท / ผู้รับจ้าง <span style="color:red;">*</span></label>
                                                 <input type="text" id="spec_new_company_name" class="form-control" placeholder="ระบุชื่อบริษัท / ห้างหุ้นส่วน" style="width:100%;">
@@ -2311,15 +2314,19 @@ $all_projects = $projects_stmt->fetchAll();
                                                 <input type="text" id="spec_new_contract_no" class="form-control" placeholder="เช่น ส. 12/2569 หรือ PO69-001" style="width:100%;">
                                             </div>
                                             <div>
-                                                <label style="font-size:0.8rem; font-weight:600; color:#475569; display:block; margin-bottom:4px;">เลขที่หนังสือ อว.</label>
-                                                <input type="text" id="spec_new_book_no" class="form-control" placeholder="เช่น อว 7321/..." style="width:100%;">
+                                                <label style="font-size:0.8rem; font-weight:600; color:#475569; display:block; margin-bottom:4px;">วันที่ลงนามในสัญญา</label>
+                                                <input type="date" id="spec_new_contract_date" class="form-control" style="width:100%;">
+                                            </div>
+                                            <div>
+                                                <label style="font-size:0.8rem; font-weight:600; color:#475569; display:block; margin-bottom:4px;">ราคา (บาท)</label>
+                                                <input type="number" step="0.01" id="spec_new_contract_amount" class="form-control" placeholder="เช่น 50000.00" style="width:100%;">
                                             </div>
                                             <div>
                                                 <label style="font-size:0.8rem; font-weight:600; color:#475569; display:block; margin-bottom:4px;">หมายเหตุ</label>
                                                 <input type="text" id="spec_new_note" class="form-control" placeholder="หมายเหตุเพิ่มเติม (ถ้ามี)" style="width:100%;">
                                             </div>
                                         </div>
-                                        <button type="button" class="btn btn-secondary" onclick="addContractAdv('spec_new_company_name', 'spec_new_contract_no', 'spec_new_book_no', 'spec_new_note')" style="font-size:0.85rem; padding:6px 16px;">
+                                        <button type="button" class="btn btn-secondary" onclick="addContractAdv('spec_new_company_name', 'spec_new_contract_no', 'spec_new_contract_date', 'spec_new_contract_amount', 'spec_new_note')" style="font-size:0.85rem; padding:6px 16px;">
                                             + บันทึกเพิ่มบริษัท
                                         </button>
                                     </div>
@@ -2352,8 +2359,8 @@ $all_projects = $projects_stmt->fetchAll();
                                                         <input type="text" name="contract_no[<?= $c['id'] ?>]" class="form-control" placeholder="เลขที่สัญญา" style="font-size:0.85rem; padding:4px 8px;" value="<?= htmlspecialchars($c['contract_no'] ?? '') ?>">
                                                     </div>
                                                     <div>
-                                                        <label style="font-size:0.75rem; color:#64748b; display:block;">เลขที่หนังสือ อว.:</label>
-                                                        <input type="text" name="book_no_mhesi[<?= $c['id'] ?>]" class="form-control" placeholder="เลขที่หนังสือ อว." style="font-size:0.85rem; padding:4px 8px;" value="<?= htmlspecialchars($c['book_no_mhesi'] ?? '') ?>">
+                                                        <label style="font-size:0.75rem; color:#64748b; display:block;">ราคา (บาท):</label>
+                                                        <input type="number" step="0.01" name="contract_amount[<?= $c['id'] ?>]" class="form-control" placeholder="ราคาตามสัญญา" style="font-size:0.85rem; padding:4px 8px;" value="<?= htmlspecialchars($c['contract_amount'] !== null ? $c['contract_amount'] : '') ?>">
                                                     </div>
                                                     <div>
                                                         <label style="font-size:0.75rem; color:#64748b; display:block;">หมายเหตุ:</label>
@@ -2472,7 +2479,7 @@ $all_projects = $projects_stmt->fetchAll();
                                 <!-- Add Contract Form -->
                                 <div style="margin-left:32px; margin-bottom:16px; background:#f8fafc; padding:16px; border-radius:8px; border:1px solid #e2e8f0;">
                                     <div style="font-size:0.9rem; font-weight:700; margin-bottom:12px; color:var(--primary-dark);">+ เพิ่มบริษัทผู้ชนะ / ข้อมูลสัญญา</div>
-                                    <div style="display:grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap:12px; margin-bottom:12px;">
+                                    <div style="display:grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap:12px; margin-bottom:12px;">
                                         <div>
                                             <label style="font-size:0.8rem; font-weight:600; color:#475569; display:block; margin-bottom:4px;">ชื่อบริษัท / ผู้รับจ้าง <span style="color:red;">*</span></label>
                                             <input type="text" id="gen_new_company_name" class="form-control" placeholder="ระบุชื่อบริษัท / ห้างหุ้นส่วน" style="width:100%;">
@@ -2482,15 +2489,19 @@ $all_projects = $projects_stmt->fetchAll();
                                             <input type="text" id="gen_new_contract_no" class="form-control" placeholder="เช่น ส. 12/2569 หรือ PO69-001" style="width:100%;">
                                         </div>
                                         <div>
-                                            <label style="font-size:0.8rem; font-weight:600; color:#475569; display:block; margin-bottom:4px;">เลขที่หนังสือ อว.</label>
-                                            <input type="text" id="gen_new_book_no" class="form-control" placeholder="เช่น อว 7321/..." style="width:100%;">
+                                            <label style="font-size:0.8rem; font-weight:600; color:#475569; display:block; margin-bottom:4px;">วันที่ลงนามในสัญญา</label>
+                                            <input type="date" id="gen_new_contract_date" class="form-control" style="width:100%;">
+                                        </div>
+                                        <div>
+                                            <label style="font-size:0.8rem; font-weight:600; color:#475569; display:block; margin-bottom:4px;">ราคา (บาท)</label>
+                                            <input type="number" step="0.01" id="gen_new_contract_amount" class="form-control" placeholder="เช่น 50000.00" style="width:100%;">
                                         </div>
                                         <div>
                                             <label style="font-size:0.8rem; font-weight:600; color:#475569; display:block; margin-bottom:4px;">หมายเหตุ</label>
                                             <input type="text" id="gen_new_note" class="form-control" placeholder="หมายเหตุเพิ่มเติม (ถ้ามี)" style="width:100%;">
                                         </div>
                                     </div>
-                                    <button type="button" class="btn btn-secondary" onclick="addContractAdv('gen_new_company_name', 'gen_new_contract_no', 'gen_new_book_no', 'gen_new_note')" style="font-size:0.85rem; padding:6px 16px;">
+                                    <button type="button" class="btn btn-secondary" onclick="addContractAdv('gen_new_company_name', 'gen_new_contract_no', 'gen_new_contract_date', 'gen_new_contract_amount', 'gen_new_note')" style="font-size:0.85rem; padding:6px 16px;">
                                         + บันทึกเพิ่มบริษัท
                                     </button>
                                 </div>
@@ -2523,8 +2534,8 @@ $all_projects = $projects_stmt->fetchAll();
                                                     <input type="text" name="contract_no[<?= $c['id'] ?>]" class="form-control" placeholder="เลขที่สัญญา" style="font-size:0.85rem; padding:4px 8px;" value="<?= htmlspecialchars($c['contract_no'] ?? '') ?>">
                                                 </div>
                                                 <div>
-                                                    <label style="font-size:0.75rem; color:#64748b; display:block;">เลขที่หนังสือ อว.:</label>
-                                                    <input type="text" name="book_no_mhesi[<?= $c['id'] ?>]" class="form-control" placeholder="เลขที่หนังสือ อว." style="font-size:0.85rem; padding:4px 8px;" value="<?= htmlspecialchars($c['book_no_mhesi'] ?? '') ?>">
+                                                    <label style="font-size:0.75rem; color:#64748b; display:block;">ราคา (บาท):</label>
+                                                    <input type="number" step="0.01" name="contract_amount[<?= $c['id'] ?>]" class="form-control" placeholder="ราคาตามสัญญา" style="font-size:0.85rem; padding:4px 8px;" value="<?= htmlspecialchars($c['contract_amount'] !== null ? $c['contract_amount'] : '') ?>">
                                                 </div>
                                                 <div>
                                                     <label style="font-size:0.75rem; color:#64748b; display:block;">หมายเหตุ:</label>
@@ -2595,8 +2606,14 @@ $all_projects = $projects_stmt->fetchAll();
                                         <?php if (!empty($c['contract_no'])): ?>
                                             <span><strong>เลขที่สัญญา:</strong> <?= htmlspecialchars($c['contract_no']) ?></span>
                                         <?php endif; ?>
-                                        <?php if (!empty($c['book_no_mhesi'])): ?>
-                                            <span><strong>เลขที่หนังสือ อว.:</strong> <?= htmlspecialchars($c['book_no_mhesi']) ?></span>
+                                        <?php if (!empty($c['contract_date'])): ?>
+                                            <span><strong>วันที่ลงนาม:</strong> <?= htmlspecialchars($c['contract_date']) ?></span>
+                                        <?php endif; ?>
+                                        <?php if ($c['contract_amount'] !== null): ?>
+                                            <span><strong>ราคา:</strong> <?= number_format($c['contract_amount'], 2) ?> บาท</span>
+                                        <?php endif; ?>
+                                        <?php if (!empty($c['note'])): ?>
+                                            <span><strong>หมายเหตุ:</strong> <?= htmlspecialchars($c['note']) ?></span>
                                         <?php endif; ?>
                                     </div>
                                 </div>
@@ -2738,7 +2755,8 @@ $all_projects = $projects_stmt->fetchAll();
                     <input type="hidden" name="project_id" value="<?= $proj_id ?>">
                     <input type="hidden" name="company_name" id="ca_company_name" value="">
                     <input type="hidden" name="contract_no" id="ca_contract_no" value="">
-                    <input type="hidden" name="book_no_mhesi" id="ca_book_no_mhesi" value="">
+                    <input type="hidden" name="contract_date" id="ca_contract_date" value="">
+                    <input type="hidden" name="contract_amount" id="ca_contract_amount" value="">
                     <input type="hidden" name="note" id="ca_note" value="">
                 </form>
                 <script>
@@ -2748,17 +2766,19 @@ $all_projects = $projects_stmt->fetchAll();
                     document.getElementById('ca_action').value = 'add_contract';
                     document.getElementById('ca_company_name').value = name;
                     document.getElementById('ca_contract_no').value = '';
-                    document.getElementById('ca_book_no_mhesi').value = '';
+                    document.getElementById('ca_contract_date').value = '';
+                    document.getElementById('ca_contract_amount').value = '';
                     document.getElementById('ca_note').value = '';
                     document.getElementById('contract_action_form').submit();
                 }
-                function addContractAdv(name_id, cno_id, book_id, note_id) {
+                function addContractAdv(name_id, cno_id, cdate_id, camount_id, note_id) {
                     var name = document.getElementById(name_id).value;
                     if (!name.trim()) { alert('กรุณากรอกชื่อบริษัท / ผู้รับจ้าง'); return; }
                     document.getElementById('ca_action').value = 'add_contract';
                     document.getElementById('ca_company_name').value = name;
                     document.getElementById('ca_contract_no').value = document.getElementById(cno_id) ? document.getElementById(cno_id).value : '';
-                    document.getElementById('ca_book_no_mhesi').value = document.getElementById(book_id) ? document.getElementById(book_id).value : '';
+                    document.getElementById('ca_contract_date').value = document.getElementById(cdate_id) ? document.getElementById(cdate_id).value : '';
+                    document.getElementById('ca_contract_amount').value = document.getElementById(camount_id) ? document.getElementById(camount_id).value : '';
                     document.getElementById('ca_note').value = document.getElementById(note_id) ? document.getElementById(note_id).value : '';
                     document.getElementById('contract_action_form').submit();
                 }
