@@ -3,6 +3,7 @@
 require_once 'db.php';
 require_once 'security.php';
 require_once 'ai_extract.php';
+require_once 'batches.php';
 secure_session_start();
 
 // Authentication Check
@@ -84,6 +85,9 @@ function refresh_project_status($pdo, $project_id) {
 
 // Helper to calculate project tracking progress
 function get_project_tracking_progress($pdo, $proj) {
+    if (!empty($proj['is_multi_round'])) {
+        return batch_progress($pdo, $proj);
+    }
     $progress_score = 1; // Step 1 is always done
     $total_steps = ($proj['procurement_method'] === 'เฉพาะเจาะจง') ? 6 : 9;
     
@@ -460,6 +464,11 @@ if (isset($_SESSION['error_flash'])) {
 // POST actions
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
     $action = $_POST['action'];
+    
+    // Multi-round procurement (batches.php): handles the action, sets a flash message and redirects
+    if (in_array($action, ['batch_enable', 'batch_add', 'batch_save', 'batch_cancel', 'batch_restore', 'batch_delete', 'project_close', 'project_reopen'], true)) {
+        batch_handle_action($pdo, $action);
+    }
     
     // User Management: Create User
     if ($action === 'create_user') {
@@ -2009,6 +2018,9 @@ $all_projects = $projects_stmt->fetchAll();
                                                     <?php if (!empty($proj['responsible_person'])): ?>
                                                         <span style="font-size:0.8rem; color:var(--primary); padding:4px 8px; background:var(--primary-glow); border-radius:4px; font-weight: 500;">ผู้รับผิดชอบ: <?= htmlspecialchars($proj['responsible_person']) ?></span>
                                                     <?php endif; ?>
+                                                    <?php if (!empty($proj['is_multi_round'])): ?>
+                                                        <span style="font-size:0.8rem; color:#1e40af; padding:4px 8px; background:#dbeafe; border-radius:4px; font-weight: 500;">จัดซื้อหลายรอบ</span>
+                                                    <?php endif; ?>
                                                 </div>
                                             </td>
                                             <td style="text-align:right; vertical-align:middle; font-weight:600; color:#475569;"><?= number_format($proj['budget'], 2) ?> บาท</td>
@@ -2020,7 +2032,11 @@ $all_projects = $projects_stmt->fetchAll();
                                                 <div style="width: 100%; background: #e2e8f0; border-radius: 10px; height: 8px; margin-bottom: 6px; overflow:hidden;">
                                                     <div style="height: 10px; border-radius: 10px; background: <?= $progress_pct == 100 ? 'var(--success)' : 'var(--secondary)' ?>; width: <?= $progress_pct ?>%;"></div>
                                                 </div>
-                                                <span style="font-size:0.75rem; color:var(--text-muted); font-weight:600;"><?= is_float($progress_score) ? rtrim(rtrim(number_format($progress_score, 2), '0'), '.') : $progress_score ?>/<?= $total_steps ?> ขั้นตอน (<?= $progress_pct ?>%)</span>
+                                                <?php if (!empty($prog['is_multi_round'])): $bs = $prog['batch_summary']; ?>
+                                                    <span style="font-size:0.75rem; color:var(--text-muted); font-weight:600;">ใช้งบ <?= number_format($bs['used_pct'], 0) ?>% &middot; รอบเสร็จ <?= $bs['completed_count'] ?>/<?= $bs['active_count'] ?><?= $bs['closed'] ? ' &middot; ปิดโครงการแล้ว' : '' ?></span>
+                                                <?php else: ?>
+                                                    <span style="font-size:0.75rem; color:var(--text-muted); font-weight:600;"><?= is_float($progress_score) ? rtrim(rtrim(number_format($progress_score, 2), '0'), '.') : $progress_score ?>/<?= $total_steps ?> ขั้นตอน (<?= $progress_pct ?>%)</span>
+                                                <?php endif; ?>
                                             </td>
                                             <td style="text-align: center; vertical-align:middle;">
                                                 <?php if ($admin_role !== 'executive'): ?>
@@ -2087,6 +2103,9 @@ $all_projects = $projects_stmt->fetchAll();
                                                 <?php if (!empty($proj['responsible_person'])): ?>
                                                     <span style="font-size:0.8rem; color:var(--primary); padding:4px 8px; background:var(--primary-glow); border-radius:4px; font-weight: 500;">ผู้รับผิดชอบ: <?= htmlspecialchars($proj['responsible_person']) ?></span>
                                                 <?php endif; ?>
+                                                <?php if (!empty($proj['is_multi_round'])): ?>
+                                                    <span style="font-size:0.8rem; color:#1e40af; padding:4px 8px; background:#dbeafe; border-radius:4px; font-weight: 500;">จัดซื้อหลายรอบ</span>
+                                                <?php endif; ?>
                                             </div>
                                         </td>
                                         <td style="text-align:right; vertical-align:middle; font-weight:600; color:#475569;"><?= number_format($proj['budget'], 2) ?> บาท</td>
@@ -2099,6 +2118,9 @@ $all_projects = $projects_stmt->fetchAll();
                                                 <div style="height: 10px; border-radius: 10px; background: var(--success); width: 100%;"></div>
                                             </div>
                                             <span style="font-size:0.75rem; color:var(--success); font-weight:600;">เสร็จสมบูรณ์ (100%)</span>
+                                            <?php if (!empty($prog['is_multi_round'])): $bs = $prog['batch_summary']; ?>
+                                                <div style="font-size:0.75rem; color:var(--text-muted);">ใช้งบ <?= number_format($bs['used_pct'], 0) ?>% &middot; <?= $bs['completed_count'] ?> รอบ</div>
+                                            <?php endif; ?>
                                         </td>
                                         <td style="text-align: center; vertical-align:middle;">
                                             <?php if ($admin_role !== 'executive'): ?>
@@ -2124,6 +2146,9 @@ $all_projects = $projects_stmt->fetchAll();
                 if (!$proj):
             ?>
                 <p style="padding:40px; text-align:center;">ไม่พบข้อมูลโครงการ</p>
+            <?php elseif (!empty($proj['is_multi_round'])):
+                include __DIR__ . '/tracking_batches.php';
+            ?>
             <?php else: 
                 $t_stmt = $pdo->prepare("SELECT * FROM project_tracking WHERE project_id = ?");
                 $t_stmt->execute([$proj_id]);
@@ -2183,6 +2208,18 @@ $all_projects = $projects_stmt->fetchAll();
                         <p style="font-size:1.1rem; font-weight:600; color:var(--primary-dark); margin-bottom:10px;"><?= htmlspecialchars($proj['project_name']) ?></p>
                         <p style="color:var(--text-muted); margin-bottom:5px;">แผน: <?= htmlspecialchars($proj['plan_name']) ?> (ปี <?= $proj['fiscal_year'] ?>)</p>
                         <p style="color:var(--text-muted);">งบประมาณ: <strong><?= number_format($proj['budget'], 2) ?> บาท</strong> | วิธีการจัดซื้อ: <?= htmlspecialchars($proj['procurement_method']) ?> | ผู้รับผิดชอบ: <strong><?= !empty($proj['responsible_person']) ? htmlspecialchars($proj['responsible_person']) : 'ไม่ระบุ' ?></strong></p>
+                        <?php if ($admin_role !== 'executive'): ?>
+                        <form action="admin.php" method="POST" style="margin-top: 14px; padding-top: 14px; border-top: 1px dashed var(--border-color); display: flex; gap: 12px; align-items: center; flex-wrap: wrap;"
+                              onsubmit="return confirm('เปลี่ยนโครงการนี้เป็นการจัดซื้อหลายรอบ?
+
+ข้อมูลการติดตามปัจจุบันจะถูกย้ายเป็น &quot;รอบที่ 1&quot; และไม่สามารถเปลี่ยนกลับเป็นแบบรอบเดียวได้');">
+                            <input type="hidden" name="action" value="batch_enable">
+                            <?= csrf_field() ?>
+                            <input type="hidden" name="project_id" value="<?= $proj_id ?>">
+                            <button type="submit" class="btn btn-secondary" style="padding: 6px 14px; font-size: 0.85rem;">แยกเป็นการจัดซื้อหลายรอบ</button>
+                            <span style="font-size: 0.8rem; color: var(--text-muted);">สำหรับโครงการที่ทยอยจัดซื้อหลายครั้งในปีงบประมาณ เช่น ค่าวัสดุโฆษณาและเผยแพร่ แต่ละรอบติดตามขั้นตอนครบวงจรและบันทึกยอดตามใบสั่งซื้อจริง</span>
+                        </form>
+                        <?php endif; ?>
                     </div>
                 </section>
 

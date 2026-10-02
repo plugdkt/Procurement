@@ -196,6 +196,41 @@ function db_initialize($pdo) {
         FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE,
         FOREIGN KEY (contract_id) REFERENCES project_contracts(id) ON DELETE CASCADE
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci");
+
+    // 9. Multi-round procurement: a project bought in several rounds through the year (one-way opt-in per project)
+    try {
+        $pdo->exec("ALTER TABLE projects
+            ADD COLUMN is_multi_round TINYINT(1) NOT NULL DEFAULT 0,
+            ADD COLUMN closed_at DATE NULL");
+    } catch (PDOException $e) {
+        // Columns might already exist
+    }
+
+    // 10. Procurement rounds (batches) of a multi-round project; each round runs the full procurement cycle
+    $pdo->exec("CREATE TABLE IF NOT EXISTS project_batches (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        project_id INT NOT NULL,
+        batch_no INT NOT NULL DEFAULT 1,                  -- รอบที่ 1, 2, 3...
+        batch_name VARCHAR(255) NOT NULL,                 -- เช่น \"ป้ายงานสัปดาห์วิทยาศาสตร์\"
+        request_amount DECIMAL(15,2) NOT NULL DEFAULT 0,  -- วงเงินที่ขออนุมัติ (จองงบไว้จนกว่าจะออกใบสั่งซื้อ)
+        po_amount DECIMAL(15,2) NULL,                     -- ยอดตามใบสั่งซื้อ/สัญญาจริง
+        po_number VARCHAR(100) NULL,
+        contractor_name VARCHAR(255) NULL,
+        batch_status VARCHAR(50) NOT NULL DEFAULT 'in_progress', -- in_progress, completed, cancelled
+        note TEXT NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci");
+
+    // 11. Steps of each round; which steps exist depends on the procurement method (see batches.php)
+    $pdo->exec("CREATE TABLE IF NOT EXISTS project_batch_steps (
+        batch_id INT NOT NULL,
+        step_key VARCHAR(50) NOT NULL,
+        status VARCHAR(50) NOT NULL DEFAULT 'pending',    -- pending, in_progress, completed
+        step_date DATE NULL,
+        PRIMARY KEY (batch_id, step_key),
+        FOREIGN KEY (batch_id) REFERENCES project_batches(id) ON DELETE CASCADE
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci");
 }
 
 // Thai Date formatting helper: e.g. 2026-05-27 -> 27 พ.ค. 2569
