@@ -245,6 +245,21 @@ function db_initialize($pdo) {
         PRIMARY KEY (batch_id, step_key),
         FOREIGN KEY (batch_id) REFERENCES project_batches(id) ON DELETE CASCADE
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci");
+
+    // 12. Project item list (for projects broken down into multiple items from the plan / PDF)
+    $pdo->exec("CREATE TABLE IF NOT EXISTS project_items (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        project_id INT NOT NULL,
+        contract_id INT NULL,
+        item_name VARCHAR(255) NOT NULL,
+        quantity VARCHAR(100) NULL,
+        budget DECIMAL(15,2) NULL,
+        actual_price DECIMAL(15,2) NULL,
+        note TEXT NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE,
+        FOREIGN KEY (contract_id) REFERENCES project_contracts(id) ON DELETE SET NULL
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci");
 }
 
 // Thai Date formatting helper: e.g. 2026-05-27 -> 27 พ.ค. 2569

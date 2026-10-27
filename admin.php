@@ -809,6 +809,22 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
                 $upd_c->execute([$cstatus, $cdate, $cno, $camount, $cnote, $cid, $project_id]);
             }
         }
+
+        // Update items linked to contracts from checkboxes
+        if (isset($_POST['contract_items']) && is_array($_POST['contract_items'])) {
+            $cids = array_keys($_POST['contract_items']);
+            $reset = $pdo->prepare("UPDATE project_items SET contract_id = NULL WHERE project_id = ? AND (contract_id IN (" . implode(',', array_map('intval', $cids)) . ") OR contract_id IS NULL)");
+            $reset->execute([$project_id]);
+
+            $assign = $pdo->prepare("UPDATE project_items SET contract_id = ? WHERE id = ? AND project_id = ?");
+            foreach ($_POST['contract_items'] as $cid => $item_ids) {
+                if (is_array($item_ids)) {
+                    foreach ($item_ids as $it_id) {
+                        $assign->execute([intval($cid), intval($it_id), $project_id]);
+                    }
+                }
+            }
+        }
         
         $_SESSION['success_flash'] = 'อัปเดตข้อมูลการติดตามสถานะสำเร็จแล้ว';
         header('Location: admin.php?view=tracking_detail&id=' . $project_id);
@@ -851,6 +867,101 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
         exit();
     }
     
+
+    // Add Project Item
+    if ($action === 'add_project_item') {
+        $project_id = intval($_POST['project_id'] ?? 0);
+        $item_name = trim($_POST['item_name'] ?? '');
+        $quantity = trim($_POST['quantity'] ?? '');
+        $budget_raw = isset($_POST['budget']) ? str_replace(',', '', trim($_POST['budget'])) : '';
+        $budget = is_numeric($budget_raw) ? floatval($budget_raw) : null;
+        $note = trim($_POST['note'] ?? '');
+        $redirect = trim($_POST['redirect'] ?? 'tracking_detail');
+
+        if ($project_id > 0 && $item_name !== '') {
+            $stmt = $pdo->prepare("INSERT INTO project_items (project_id, item_name, quantity, budget, note) VALUES (?, ?, ?, ?, ?)");
+            $stmt->execute([$project_id, $item_name, $quantity ?: null, $budget, $note ?: null]);
+            $_SESSION['success_flash'] = 'เพิ่มรายการพัสดุเรียบร้อยแล้ว';
+        } else {
+            $_SESSION['error_flash'] = 'กรุณาระบุชื่อรายการพัสดุ';
+        }
+        if ($redirect === 'plan_detail' && !empty($_POST['plan_id'])) {
+            header('Location: admin.php?view=plan_detail&id=' . intval($_POST['plan_id']));
+        } else {
+            header('Location: admin.php?view=tracking_detail&id=' . $project_id);
+        }
+        exit();
+    }
+
+    // Import Multiple Items from Plan (via AI or Plan selection)
+    if ($action === 'import_plan_items') {
+        $project_id = intval($_POST['project_id'] ?? 0);
+        $items = is_array($_POST['selected_items'] ?? null) ? $_POST['selected_items'] : [];
+        $redirect = trim($_POST['redirect'] ?? 'tracking_detail');
+
+        if ($project_id > 0 && !empty($items)) {
+            $stmt = $pdo->prepare("INSERT INTO project_items (project_id, item_name, quantity, budget, note) VALUES (?, ?, ?, ?, ?)");
+            $imported = 0;
+            foreach ($items as $item) {
+                $name = trim($item['item_name'] ?? '');
+                if ($name === '') continue;
+                $qty = trim($item['quantity'] ?? '');
+                $b_raw = isset($item['budget']) ? str_replace(',', '', trim($item['budget'])) : '';
+                $b = is_numeric($b_raw) ? floatval($b_raw) : null;
+                $n = trim($item['note'] ?? '');
+                $stmt->execute([$project_id, $name, $qty ?: null, $b, $n ?: null]);
+                $imported++;
+            }
+            $_SESSION['success_flash'] = 'นำเข้ารายการพัสดุจากแผนสำเร็จ ' . $imported . ' รายการ';
+        } else {
+            $_SESSION['error_flash'] = 'กรุณาเลือกรายการที่ต้องการนำเข้าอย่างน้อย 1 รายการ';
+        }
+        if ($redirect === 'plan_detail' && !empty($_POST['plan_id'])) {
+            header('Location: admin.php?view=plan_detail&id=' . intval($_POST['plan_id']));
+        } else {
+            header('Location: admin.php?view=tracking_detail&id=' . $project_id);
+        }
+        exit();
+    }
+
+    // AJAX endpoint to get AI-extracted items for a plan
+    if ($action === 'get_plan_ai_items') {
+        header('Content-Type: application/json; charset=utf-8');
+        $plan_id = intval($_POST['plan_id'] ?? 0);
+
+        $stmt = $pdo->prepare("SELECT * FROM plans WHERE id = ?");
+        $stmt->execute([$plan_id]);
+        $plan = $stmt->fetch();
+        if (!$plan) {
+            echo json_encode(['ok' => false, 'error' => 'ไม่พบข้อมูลแผนงาน'], JSON_UNESCAPED_UNICODE);
+            exit();
+        }
+
+        // Check if items are in session
+        $cached = $_SESSION['ai_extract'][$plan_id]['projects'] ?? null;
+        if ($cached && !empty($cached)) {
+            echo json_encode(['ok' => true, 'items' => $cached, 'source' => 'cache'], JSON_UNESCAPED_UNICODE);
+            exit();
+        }
+
+        // If not cached in session, extract directly from PDF
+        try {
+            @set_time_limit(240);
+            require_once __DIR__ . '/ai_extract.php';
+            $pdf_file = __DIR__ . '/' . $plan['file_path'];
+            if (!is_file($pdf_file)) {
+                echo json_encode(['ok' => false, 'error' => 'ไม่พบไฟล์ PDF ของแผนงาน'], JSON_UNESCAPED_UNICODE);
+                exit();
+            }
+            $result = ai_extract_projects($pdf_file, $plan['fiscal_year']);
+            secure_session_start();
+            ai_draft_add($plan_id, $result, true);
+            echo json_encode(['ok' => true, 'items' => $result['projects'], 'source' => 'ai'], JSON_UNESCAPED_UNICODE);
+        } catch (Exception $e) {
+            echo json_encode(['ok' => false, 'error' => $e->getMessage()], JSON_UNESCAPED_UNICODE);
+        }
+        exit();
+    }
     // Add Contract
     if ($action === 'add_contract') {
         $project_id = intval($_POST['project_id'] ?? 0);
@@ -1071,6 +1182,26 @@ if (isset($_GET['action']) && $_GET['action'] === 'delete_installment') {
         $_SESSION['success_flash'] = 'ลบงวดงานสำเร็จแล้ว';
     }
     header('Location: admin.php?view=tracking_detail&id=' . $project_id);
+    exit();
+}
+
+
+// Delete Project Item (GET action)
+if (isset($_GET['action']) && $_GET['action'] === 'delete_project_item') {
+    $item_id = intval($_GET['id'] ?? 0);
+    $project_id = intval($_GET['project_id'] ?? 0);
+    $redirect = trim($_GET['ref'] ?? 'tracking_detail');
+    $plan_id = intval($_GET['plan_id'] ?? 0);
+    if ($item_id > 0 && $project_id > 0) {
+        $stmt = $pdo->prepare("DELETE FROM project_items WHERE id = ? AND project_id = ?");
+        $stmt->execute([$item_id, $project_id]);
+        $_SESSION['success_flash'] = 'ลบรายการพัสดุสำเร็จแล้ว';
+    }
+    if ($redirect === 'plan_detail' && $plan_id > 0) {
+        header('Location: admin.php?view=plan_detail&id=' . $plan_id);
+    } else {
+        header('Location: admin.php?view=tracking_detail&id=' . $project_id);
+    }
     exit();
 }
 
@@ -1385,7 +1516,7 @@ $all_projects = $projects_stmt->fetchAll();
                 $plan_info = $plan_stmt->fetch();
                 
                 if ($plan_info):
-                    $sub_proj_stmt = $pdo->prepare("SELECT * FROM projects WHERE plan_id = ? ORDER BY id DESC");
+                    $sub_proj_stmt = $pdo->prepare("SELECT p.*, (SELECT COUNT(*) FROM project_items WHERE project_id = p.id) AS item_count FROM projects p WHERE p.plan_id = ? ORDER BY p.id DESC");
                     $sub_proj_stmt->execute([$plan_id]);
                     $sub_projects = $sub_proj_stmt->fetchAll();
                 else:
@@ -1590,6 +1721,9 @@ $all_projects = $projects_stmt->fetchAll();
                                                     <span>ปริมาณ: <strong style="color:#475569;"><?= htmlspecialchars($sp['quantity']) ?></strong></span>
                                                     <span>กำหนดใช้: <strong style="color:#475569;"><?= format_month_year($sp['required_date']) ?></strong></span>
                                                     <span>ผู้รับผิดชอบ: <strong style="color:var(--primary);"><?= !empty($sp['responsible_person']) ? htmlspecialchars($sp['responsible_person']) : '-' ?></strong></span>
+                                                    <?php if (($sp['item_count'] ?? 0) > 0): ?>
+                                                        <span><a href="admin.php?view=tracking_detail&id=<?= $sp['id'] ?>" class="badge badge-success" style="text-decoration:none; font-size:0.75rem; padding: 2px 8px; border-radius: 12px; background: #e0f2fe; color: #0284c7; font-weight:600;">📦 มีรายการพัสดุ (<?= $sp['item_count'] ?> รายการ)</a></span>
+                                                    <?php endif; ?>
                                                 </div>
                                             </td>
                                             <td style="font-weight: 600;"><?= number_format($sp['budget'], 2) ?> บาท</td>
@@ -1598,6 +1732,11 @@ $all_projects = $projects_stmt->fetchAll();
                                             <td><?= format_month_year($sp['request_month']) ?></td>
                                             <td style="text-align: center;">
                                                 <div style="display: flex; gap: 6px; justify-content: center; align-items: center;">
+                                                    <a href="admin.php?view=tracking_detail&id=<?= $sp['id'] ?>" class="btn btn-secondary btn-icon-only" title="ติดตามสถานะโครงการและจัดการรายการพัสดุ">
+                                                        <svg style="width:14px;height:14px;fill:currentColor;" viewBox="0 0 24 24">
+                                                            <path d="M19 3H5c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h14c1.1 0 2-.9 2-2V5c0-1.1-.9-2-2-2zm-9 14l-5-5 1.41-1.41L10 14.17l7.59-7.59L19 8l-9 9z"/>
+                                                        </svg>
+                                                    </a>
                                                     <button type="button" class="btn btn-secondary btn-icon-only" title="แก้ไขโครงการ" 
                                                             onclick="openEditProject(<?= $sp['id'] ?>, <?= htmlspecialchars(json_encode($sp['project_name'])) ?>, <?= $sp['budget'] ?>, <?= $sp['plan_id'] ?>, <?= htmlspecialchars(json_encode($sp['procurement_type'])) ?>, <?= htmlspecialchars(json_encode($sp['quantity'])) ?>, <?= htmlspecialchars(json_encode($sp['required_date'])) ?>, <?= htmlspecialchars(json_encode($sp['procurement_method'])) ?>, <?= htmlspecialchars(json_encode($sp['request_month'])) ?>, <?= htmlspecialchars(json_encode($sp['contract_month'])) ?>, <?= htmlspecialchars(json_encode($sp['responsible_person'])) ?>)">
                                                         <svg style="width:14px;height:14px;fill:currentColor;" viewBox="0 0 24 24">
@@ -2176,6 +2315,10 @@ $all_projects = $projects_stmt->fetchAll();
                 $cont_stmt = $pdo->prepare("SELECT * FROM project_contracts WHERE project_id = ? ORDER BY id ASC");
                 $cont_stmt->execute([$proj_id]);
                 $contracts = $cont_stmt->fetchAll();
+                $items_stmt = $pdo->prepare("SELECT pi.*, pc.company_name FROM project_items pi LEFT JOIN project_contracts pc ON pi.contract_id = pc.id WHERE pi.project_id = ? ORDER BY pi.id ASC");
+                $items_stmt->execute([$proj_id]);
+                $project_items = $items_stmt->fetchAll();
+
                 
                 // Group installments by contract
                 $inst_by_contract = [];
@@ -2232,6 +2375,91 @@ $all_projects = $projects_stmt->fetchAll();
                     </div>
                 </section>
 
+                <!-- Project Items Card -->
+                <section class="card-table-wrap" style="margin-bottom: 30px;">
+                    <div class="card-table-header" style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:10px;">
+                        <div>
+                            <h2>รายการพัสดุ / ครุภัณฑ์ในโครงการ (<?= count($project_items) ?> รายการ)</h2>
+                            <p style="font-size:0.85rem; color:var(--text-muted); margin-top:2px;">
+                                ข้อมูลรายการย่อยที่ใช้ในการจัดซื้อ/จ้างครั้งนี้ (ผูกกับบริษัทผู้ชนะสัญญาในขั้นตอนการทำสัญญาด้านล่างได้)
+                            </p>
+                        </div>
+                        <?php if ($admin_role !== 'executive'): ?>
+                        <div style="display:flex; gap:8px; flex-wrap:wrap;">
+                            <button type="button" class="btn btn-secondary" onclick="openImportPlanItemsModal(<?= $proj['plan_id'] ?>, <?= $proj_id ?>)" style="font-size:0.85rem; padding:6px 14px;">
+                                ✨ ดึงรายการจากแผนประจำปี (AI)
+                            </button>
+                            <button type="button" class="btn btn-primary" onclick="showModal('add-item-modal')" style="font-size:0.85rem; padding:6px 14px;">
+                                + เพิ่มรายการเอง
+                            </button>
+                        </div>
+                        <?php endif; ?>
+                    </div>
+                    <div style="padding: 16px 20px;">
+                        <?php if (empty($project_items)): ?>
+                            <div style="text-align:center; padding: 24px; color:var(--text-muted); background:#f8fafc; border-radius:8px; border:1px dashed #cbd5e1;">
+                                ยังไม่มีรายการพัสดุย่อยในโครงการนี้ ท่านสามารถกดปุ่ม <strong>"✨ ดึงรายการจากแผนประจำปี (AI)"</strong> เพื่อเลือกรายการที่ AI อ่านจากไฟล์แผน หรือกด <strong>"+ เพิ่มรายการเอง"</strong> ได้
+                            </div>
+                        <?php else: 
+                            $items_total_budget = array_sum(array_column($project_items, 'budget'));
+                        ?>
+                            <div class="table-responsive">
+                                <table class="table-admin" style="font-size: 0.9rem;">
+                                    <thead>
+                                        <tr style="background:#f1f5f9;">
+                                            <th width="50px" style="text-align:center;">#</th>
+                                            <th>ชื่อรายการพัสดุ / ครุภัณฑ์</th>
+                                            <th width="130px" style="text-align:center;">จำนวน/หน่วย</th>
+                                            <th width="150px" style="text-align:right;">งบประมาณ (บาท)</th>
+                                            <th width="220px">บริษัทผู้ชนะสัญญา</th>
+                                            <th width="70px" style="text-align:center;">จัดการ</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody>
+                                        <?php foreach ($project_items as $idx => $item): ?>
+                                        <tr>
+                                            <td style="text-align:center;"><?= $idx + 1 ?></td>
+                                            <td>
+                                                <strong style="color:var(--primary-dark);"><?= htmlspecialchars($item['item_name']) ?></strong>
+                                                <?php if (!empty($item['note'])): ?>
+                                                    <div style="font-size:0.75rem; color:#64748b;"><?= htmlspecialchars($item['note']) ?></div>
+                                                <?php endif; ?>
+                                            </td>
+                                            <td style="text-align:center;"><?= htmlspecialchars($item['quantity'] ?? '-') ?></td>
+                                            <td style="text-align:right; font-weight:600;"><?= $item['budget'] !== null ? number_format($item['budget'], 2) : '-' ?></td>
+                                            <td>
+                                                <?php if (!empty($item['company_name'])): ?>
+                                                    <span style="display:inline-block; padding:3px 10px; border-radius:12px; background:#dcfce7; color:#166534; font-size:0.8rem; font-weight:600;">
+                                                        <?= htmlspecialchars($item['company_name']) ?>
+                                                    </span>
+                                                <?php else: ?>
+                                                    <span style="color:#94a3b8; font-size:0.8rem;">(ยังไม่กำหนดผู้ชนะ)</span>
+                                                <?php endif; ?>
+                                            </td>
+                                            <td style="text-align:center;">
+                                                <?php if ($admin_role !== 'executive'): ?>
+                                                    <a href="admin.php?action=delete_project_item&<?= csrf_query() ?>&id=<?= $item['id'] ?>&project_id=<?= $proj_id ?>" 
+                                                       class="btn btn-danger btn-icon-only" style="padding:2px 8px; font-size:0.75rem;" 
+                                                       onclick="return confirm('ยืนยันลบรายการนี้?')" title="ลบรายการ">
+                                                        ลบ
+                                                    </a>
+                                                <?php endif; ?>
+                                            </td>
+                                        </tr>
+                                        <?php endforeach; ?>
+                                    </tbody>
+                                    <tfoot>
+                                        <tr style="background:#f8fafc; font-weight:700;">
+                                            <td colspan="3" style="text-align:right;">รวมทั้งหมด (<?= count($project_items) ?> รายการ):</td>
+                                            <td style="text-align:right; color:var(--primary-dark); font-size:1rem;"><?= number_format($items_total_budget, 2) ?> บาท</td>
+                                            <td colspan="2"></td>
+                                        </tr>
+                                    </tfoot>
+                                </table>
+                            </div>
+                        <?php endif; ?>
+                    </div>
+                </section>
                 <form action="admin.php" method="POST">
                     <input type="hidden" name="action" value="update_tracking">
                     <?= csrf_field() ?>
@@ -2366,6 +2594,36 @@ $all_projects = $projects_stmt->fetchAll();
                                                         <label style="font-size:0.75rem; color:#64748b; display:block;">หมายเหตุ:</label>
                                                         <input type="text" name="contract_note[<?= $c['id'] ?>]" class="form-control" placeholder="หมายเหตุ" style="font-size:0.85rem; padding:4px 8px;" value="<?= htmlspecialchars($c['note'] ?? '') ?>">
                                                     </div>
+
+                                                <!-- Contract Items Assignment -->
+                                                <?php if (!empty($project_items)): ?>
+                                                <div style="margin-top:12px; padding-top:10px; border-top:1px dashed #e2e8f0; grid-column: 1 / -1;">
+                                                    <div style="font-size:0.8rem; font-weight:600; color:#475569; margin-bottom:6px; display:flex; justify-content:space-between; align-items:center;">
+                                                        <span>📦 รายการพัสดุที่บริษัทนี้ได้รับ (ชนะการประกวด/ตกลงราคา):</span>
+                                                        <span style="font-size:0.75rem; color:var(--text-muted);">ติ๊กเลือกรายการที่บริษัทนี้เป็นผู้ชนะ</span>
+                                                    </div>
+                                                    <div style="background:#f8fafc; padding:8px 12px; border-radius:6px; border:1px solid #e2e8f0; display:grid; grid-template-columns:repeat(auto-fill, minmax(280px, 1fr)); gap:6px;">
+                                                        <?php foreach ($project_items as $it): 
+                                                            $is_mine = ($it['contract_id'] == $c['id']);
+                                                            $is_taken_other = (!empty($it['contract_id']) && $it['contract_id'] != $c['id']);
+                                                        ?>
+                                                        <label style="display:flex; align-items:flex-start; gap:8px; font-size:0.8rem; padding:4px 6px; border-radius:4px; <?= $is_mine ? 'background:#e0f2fe; font-weight:600;' : ($is_taken_other ? 'opacity:0.65; background:#fff1f2;' : 'background:white;') ?> border:1px solid <?= $is_mine ? '#7dd3fc' : ($is_taken_other ? '#fecdd3' : '#e2e8f0') ?>; cursor:pointer;">
+                                                            <input type="checkbox" name="contract_items[<?= $c['id'] ?>][]" value="<?= $it['id'] ?>" <?= $is_mine ? 'checked' : '' ?>>
+                                                            <span style="flex:1;">
+                                                                <?= htmlspecialchars($it['item_name']) ?>
+                                                                <span style="font-size:0.75rem; color:#64748b; font-weight:normal; display:block;">
+                                                                    <?= htmlspecialchars($it['quantity'] ?? '') ?> 
+                                                                    <?php if ($it['budget'] !== null): ?>&middot; งบ <?= number_format($it['budget'], 2) ?> บ.<?php endif; ?>
+                                                                    <?php if ($is_taken_other): ?>
+                                                                        <span style="color:#b91c1c; font-weight:600;">(<?= htmlspecialchars($it['company_name'] ?? 'บริษัทอื่น') ?> ได้รับแล้ว)</span>
+                                                                    <?php endif; ?>
+                                                                </span>
+                                                            </span>
+                                                        </label>
+                                                        <?php endforeach; ?>
+                                                    </div>
+                                                </div>
+                                                <?php endif; ?>
                                                 </div>
                                             </div>
                                         <?php endforeach; ?>
@@ -2541,6 +2799,36 @@ $all_projects = $projects_stmt->fetchAll();
                                                     <label style="font-size:0.75rem; color:#64748b; display:block;">หมายเหตุ:</label>
                                                     <input type="text" name="contract_note[<?= $c['id'] ?>]" class="form-control" placeholder="หมายเหตุ" style="font-size:0.85rem; padding:4px 8px;" value="<?= htmlspecialchars($c['note'] ?? '') ?>">
                                                 </div>
+
+                                                <!-- Contract Items Assignment -->
+                                                <?php if (!empty($project_items)): ?>
+                                                <div style="margin-top:12px; padding-top:10px; border-top:1px dashed #e2e8f0; grid-column: 1 / -1;">
+                                                    <div style="font-size:0.8rem; font-weight:600; color:#475569; margin-bottom:6px; display:flex; justify-content:space-between; align-items:center;">
+                                                        <span>📦 รายการพัสดุที่บริษัทนี้ได้รับ (ชนะการประกวด/ตกลงราคา):</span>
+                                                        <span style="font-size:0.75rem; color:var(--text-muted);">ติ๊กเลือกรายการที่บริษัทนี้เป็นผู้ชนะ</span>
+                                                    </div>
+                                                    <div style="background:#f8fafc; padding:8px 12px; border-radius:6px; border:1px solid #e2e8f0; display:grid; grid-template-columns:repeat(auto-fill, minmax(280px, 1fr)); gap:6px;">
+                                                        <?php foreach ($project_items as $it): 
+                                                            $is_mine = ($it['contract_id'] == $c['id']);
+                                                            $is_taken_other = (!empty($it['contract_id']) && $it['contract_id'] != $c['id']);
+                                                        ?>
+                                                        <label style="display:flex; align-items:flex-start; gap:8px; font-size:0.8rem; padding:4px 6px; border-radius:4px; <?= $is_mine ? 'background:#e0f2fe; font-weight:600;' : ($is_taken_other ? 'opacity:0.65; background:#fff1f2;' : 'background:white;') ?> border:1px solid <?= $is_mine ? '#7dd3fc' : ($is_taken_other ? '#fecdd3' : '#e2e8f0') ?>; cursor:pointer;">
+                                                            <input type="checkbox" name="contract_items[<?= $c['id'] ?>][]" value="<?= $it['id'] ?>" <?= $is_mine ? 'checked' : '' ?>>
+                                                            <span style="flex:1;">
+                                                                <?= htmlspecialchars($it['item_name']) ?>
+                                                                <span style="font-size:0.75rem; color:#64748b; font-weight:normal; display:block;">
+                                                                    <?= htmlspecialchars($it['quantity'] ?? '') ?> 
+                                                                    <?php if ($it['budget'] !== null): ?>&middot; งบ <?= number_format($it['budget'], 2) ?> บ.<?php endif; ?>
+                                                                    <?php if ($is_taken_other): ?>
+                                                                        <span style="color:#b91c1c; font-weight:600;">(<?= htmlspecialchars($it['company_name'] ?? 'บริษัทอื่น') ?> ได้รับแล้ว)</span>
+                                                                    <?php endif; ?>
+                                                                </span>
+                                                            </span>
+                                                        </label>
+                                                        <?php endforeach; ?>
+                                                    </div>
+                                                </div>
+                                                <?php endif; ?>
                                             </div>
                                         </div>
                                     <?php endforeach; ?>
@@ -3634,5 +3922,182 @@ $all_projects = $projects_stmt->fetchAll();
         </div>
     </div>
 
+
+    <!-- Modal: Add Single Project Item -->
+    <div class="modal" id="add-item-modal">
+        <div class="modal-content" style="max-width: 550px;">
+            <div class="modal-header">
+                <h3>+ เพิ่มรายการพัสดุในโครงการ</h3>
+                <button type="button" class="modal-close" onclick="closeModal('add-item-modal')">&times;</button>
+            </div>
+            <form action="admin.php" method="POST" style="padding: 24px;">
+                <input type="hidden" name="action" value="add_project_item">
+                <?= csrf_field() ?>
+                <input type="hidden" name="project_id" value="<?= $proj_id ?? 0 ?>">
+                <div class="form-group" style="margin-bottom: 16px;">
+                    <label>ชื่อรายการพัสดุ / ครุภัณฑ์ <span style="color:red;">*</span></label>
+                    <input type="text" name="item_name" class="form-control" placeholder="เช่น กล้องจุลทรรศน์, โต๊ะทำงาน..." required>
+                </div>
+                <div class="grid-2" style="margin-bottom: 16px;">
+                    <div class="form-group">
+                        <label>จำนวนและหน่วยนับ</label>
+                        <input type="text" name="quantity" class="form-control" placeholder="เช่น 2 เครื่อง, 1 ชุด">
+                    </div>
+                    <div class="form-group">
+                        <label>งบประมาณ (บาท)</label>
+                        <input type="number" step="0.01" name="budget" class="form-control" placeholder="เช่น 900000.00">
+                    </div>
+                </div>
+                <div class="form-group" style="margin-bottom: 20px;">
+                    <label>หมายเหตุ</label>
+                    <input type="text" name="note" class="form-control" placeholder="หมายเหตุเพิ่มเติม (ถ้ามี)">
+                </div>
+                <div class="modal-footer" style="padding:0;">
+                    <button type="button" class="btn btn-secondary" onclick="closeModal('add-item-modal')">ยกเลิก</button>
+                    <button type="submit" class="btn btn-primary">บันทึกรายการ</button>
+                </div>
+            </form>
+        </div>
+    </div>
+
+    <!-- Modal: Import Items from Plan (AI Selection) -->
+    <div class="modal" id="import-plan-items-modal">
+        <div class="modal-content" style="max-width: 850px; width: 90%;">
+            <div class="modal-header">
+                <h3>✨ เลือกดึงรายการพัสดุจากไฟล์แผนจัดซื้อประจำปี (AI)</h3>
+                <button type="button" class="modal-close" onclick="closeModal('import-plan-items-modal')">&times;</button>
+            </div>
+            <form action="admin.php" method="POST" id="import-plan-items-form" style="padding: 20px;">
+                <input type="hidden" name="action" value="import_plan_items">
+                <?= csrf_field() ?>
+                <input type="hidden" name="project_id" id="import_items_project_id" value="<?= $proj_id ?? 0 ?>">
+                <input type="hidden" name="plan_id" id="import_items_plan_id" value="<?= $proj['plan_id'] ?? 0 ?>">
+
+                <div id="import-items-loading" style="text-align:center; padding: 40px; color:var(--text-muted);">
+                    <div style="font-size: 1.1rem; margin-bottom: 8px;">กำลังดึงรายการพัสดุจากไฟล์แผนด้วย AI...</div>
+                    <div style="font-size: 0.85rem; color:#64748b;">ระบบกำลังอ่านไฟล์ PDF และประมวลผล กรุณารอสักครู่ (ประมาณ 5-10 วินาที)</div>
+                </div>
+
+                <div id="import-items-content" style="display:none;">
+                    <p style="font-size:0.9rem; color:var(--text-muted); margin-bottom:12px;">
+                        ติ๊กเลือกรายการที่ต้องการนำเข้ามาเป็นรายการพัสดุในโครงการนี้:
+                    </p>
+                    <div style="max-height: 400px; overflow-y: auto; border: 1px solid var(--border-color); border-radius: 8px;">
+                        <table class="table-admin" style="font-size: 0.85rem; margin:0;" id="ai-items-table">
+                            <thead>
+                                <tr style="background:#f1f5f9; position:sticky; top:0; z-index:1;">
+                                    <th width="40px" style="text-align:center;">
+                                        <input type="checkbox" id="check-all-ai-items" checked onclick="toggleAllAiItems(this.checked)">
+                                    </th>
+                                    <th width="40px">#</th>
+                                    <th>ชื่อรายการพัสดุ / ครุภัณฑ์</th>
+                                    <th width="120px" style="text-align:center;">จำนวน</th>
+                                    <th width="150px" style="text-align:right;">งบประมาณ (บาท)</th>
+                                </tr>
+                            </thead>
+                            <tbody id="ai-items-tbody"></tbody>
+                        </table>
+                    </div>
+                    <div style="display:flex; justify-content:space-between; align-items:center; margin-top:16px; padding-top:12px; border-top:1px solid #e2e8f0;">
+                        <div id="ai-items-selected-summary" style="font-weight:600; color:var(--primary-dark); font-size:0.9rem;"></div>
+                        <div style="display:flex; gap:10px;">
+                            <button type="button" class="btn btn-secondary" onclick="closeModal('import-plan-items-modal')">ยกเลิก</button>
+                            <button type="submit" class="btn btn-primary" id="btn-submit-import-items">นำเข้ารายการที่เลือก</button>
+                        </div>
+                    </div>
+                </div>
+            </form>
+        </div>
+    </div>
+
+    <script>
+    let globalAiItems = [];
+
+    function openImportPlanItemsModal(planId, projId) {
+        document.getElementById('import_items_project_id').value = projId;
+        document.getElementById('import_items_plan_id').value = planId;
+        document.getElementById('import-items-loading').style.display = 'block';
+        document.getElementById('import-items-content').style.display = 'none';
+        showModal('import-plan-items-modal');
+
+        const formData = new FormData();
+        formData.append('action', 'get_plan_ai_items');
+        formData.append('plan_id', planId);
+        formData.append('project_id', projId);
+        formData.append('<?= csrf_token_name() ?>', '<?= csrf_token_value() ?>');
+
+        fetch('admin.php', { method: 'POST', body: formData })
+            .then(res => res.json())
+            .then(data => {
+                document.getElementById('import-items-loading').style.display = 'none';
+                if (!data.ok) {
+                    alert('ไม่สามารถดึงข้อมูลรายการได้: ' + (data.error || 'เกิดข้อผิดพลาด'));
+                    closeModal('import-plan-items-modal');
+                    return;
+                }
+                globalAiItems = data.items || [];
+                renderAiItemsTable(globalAiItems);
+                document.getElementById('import-items-content').style.display = 'block';
+            })
+            .catch(err => {
+                document.getElementById('import-items-loading').style.display = 'none';
+                alert('เกิดข้อผิดพลาดในการเชื่อมต่อเซิร์ฟเวอร์');
+                closeModal('import-plan-items-modal');
+            });
+    }
+
+    function renderAiItemsTable(items) {
+        const tbody = document.getElementById('ai-items-tbody');
+        tbody.innerHTML = '';
+        if (items.length === 0) {
+            tbody.innerHTML = '<tr><td colspan="5" style="text-align:center; padding:30px; color:#94a3b8;">ไม่พบรายการในไฟล์แผน</td></tr>';
+            return;
+        }
+
+        items.forEach((it, idx) => {
+            const tr = document.createElement('tr');
+            tr.innerHTML = `
+                <td style="text-align:center;">
+                    <input type="checkbox" class="ai-item-chk" name="selected_items[${idx}][selected]" value="1" checked onchange="updateAiSelectedSummary()">
+                    <input type="hidden" name="selected_items[${idx}][item_name]" value="${escapeHtml(it.project_name || '')}">
+                    <input type="hidden" name="selected_items[${idx}][quantity]" value="${escapeHtml(it.quantity || '')}">
+                    <input type="hidden" name="selected_items[${idx}][budget]" value="${it.budget || ''}">
+                    <input type="hidden" name="selected_items[${idx}][note]" value="${escapeHtml(it.note || '')}">
+                </td>
+                <td>${idx + 1}</td>
+                <td><strong>${escapeHtml(it.project_name || '')}</strong></td>
+                <td style="text-align:center;">${escapeHtml(it.quantity || '-')}</td>
+                <td style="text-align:right; font-weight:600;">${Number(it.budget || 0).toLocaleString('th-TH', {minimumFractionDigits: 2, maximumFractionDigits: 2})}</td>
+            `;
+            tbody.appendChild(tr);
+        });
+        updateAiSelectedSummary();
+    }
+
+    function toggleAllAiItems(checked) {
+        document.querySelectorAll('.ai-item-chk').forEach(c => c.checked = checked);
+        updateAiSelectedSummary();
+    }
+
+    function updateAiSelectedSummary() {
+        const chks = document.querySelectorAll('.ai-item-chk');
+        let count = 0;
+        let sum = 0;
+        chks.forEach((c, idx) => {
+            if (c.checked && globalAiItems[idx]) {
+                count++;
+                sum += Number(globalAiItems[idx].budget || 0);
+            }
+        });
+        document.getElementById('ai-items-selected-summary').innerText = 
+            'เลือก ' + count + ' / ' + chks.length + ' รายการ (งบประมาณรวม: ' + sum.toLocaleString('th-TH', {minimumFractionDigits: 2, maximumFractionDigits: 2}) + ' บาท)';
+        document.getElementById('btn-submit-import-items').disabled = (count === 0);
+    }
+
+    function escapeHtml(text) {
+        const map = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#039;' };
+        return String(text).replace(/[&<>"']/g, m => map[m]);
+    }
+    </script>
 </body>
 </html>
