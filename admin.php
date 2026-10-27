@@ -2466,7 +2466,12 @@ $all_projects = $projects_stmt->fetchAll();
                                                 <?php if ($admin_role !== 'executive'): ?>
                                                     <div style="display:flex; gap:6px; justify-content:center; align-items:center;">
                                                         <button type="button" class="btn btn-secondary btn-icon-only" style="padding:4px 8px; font-size:0.75rem;" title="แก้ไขรายการ"
-                                                                onclick="openEditItem(<?= $item['id'] ?>, <?= htmlspecialchars(json_encode($item['item_name'])) ?>, <?= htmlspecialchars(json_encode($item['quantity'] ?? '')) ?>, <?= json_encode($item['budget']) ?>, <?= htmlspecialchars(json_encode($item['note'] ?? '')) ?>)">
+                                                                data-id="<?= $item['id'] ?>"
+                                                                data-name="<?= htmlspecialchars($item['item_name'], ENT_QUOTES, 'UTF-8') ?>"
+                                                                data-quantity="<?= htmlspecialchars($item['quantity'] ?? '', ENT_QUOTES, 'UTF-8') ?>"
+                                                                data-budget="<?= htmlspecialchars($item['budget'] ?? '', ENT_QUOTES, 'UTF-8') ?>"
+                                                                data-note="<?= htmlspecialchars($item['note'] ?? '', ENT_QUOTES, 'UTF-8') ?>"
+                                                                onclick="openEditItem(this)">
                                                             <svg style="width:14px;height:14px;fill:currentColor;" viewBox="0 0 24 24">
                                                                 <path d="M3 17.25V21h3.75L17.81 9.94l-3.75-3.75L3 17.25zM20.71 7.04c.39-.39.39-1.02 0-1.41l-2.34-2.34c-.39-.39-1.02-.39-1.41 0l-1.83 1.83 3.75 3.75 1.83-1.83z"/>
                                                             </svg>
@@ -4087,12 +4092,20 @@ $all_projects = $projects_stmt->fetchAll();
     <script>
     let globalAiItems = [];
 
-    function openEditItem(id, name, qty, budget, note) {
-        document.getElementById('edit_item_id').value = id;
-        document.getElementById('edit_item_name').value = name;
-        document.getElementById('edit_item_quantity').value = qty || '';
-        document.getElementById('edit_item_budget').value = (budget !== null && budget !== undefined) ? budget : '';
-        document.getElementById('edit_item_note').value = note || '';
+    function openEditItem(btn, name, qty, budget, note) {
+        if (typeof btn === 'object' && btn !== null && btn.dataset) {
+            document.getElementById('edit_item_id').value = btn.dataset.id || '';
+            document.getElementById('edit_item_name').value = btn.dataset.name || '';
+            document.getElementById('edit_item_quantity').value = btn.dataset.quantity || '';
+            document.getElementById('edit_item_budget').value = btn.dataset.budget || '';
+            document.getElementById('edit_item_note').value = btn.dataset.note || '';
+        } else {
+            document.getElementById('edit_item_id').value = btn || '';
+            document.getElementById('edit_item_name').value = name || '';
+            document.getElementById('edit_item_quantity').value = qty || '';
+            document.getElementById('edit_item_budget').value = (budget !== null && budget !== undefined) ? budget : '';
+            document.getElementById('edit_item_note').value = note || '';
+        }
         showModal('edit-item-modal');
     }
 
