@@ -893,6 +893,32 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
         exit();
     }
 
+    // Edit Project Item
+    if ($action === 'edit_project_item') {
+        $item_id = intval($_POST['item_id'] ?? 0);
+        $project_id = intval($_POST['project_id'] ?? 0);
+        $item_name = trim($_POST['item_name'] ?? '');
+        $quantity = trim($_POST['quantity'] ?? '');
+        $budget_raw = isset($_POST['budget']) ? str_replace(',', '', trim($_POST['budget'])) : '';
+        $budget = is_numeric($budget_raw) ? floatval($budget_raw) : null;
+        $note = trim($_POST['note'] ?? '');
+        $redirect = trim($_POST['redirect'] ?? 'tracking_detail');
+
+        if ($item_id > 0 && $project_id > 0 && $item_name !== '') {
+            $stmt = $pdo->prepare("UPDATE project_items SET item_name = ?, quantity = ?, budget = ?, note = ? WHERE id = ? AND project_id = ?");
+            $stmt->execute([$item_name, $quantity ?: null, $budget, $note ?: null, $item_id, $project_id]);
+            $_SESSION['success_flash'] = 'แก้ไขรายการพัสดุเรียบร้อยแล้ว';
+        } else {
+            $_SESSION['error_flash'] = 'กรุณาระบุชื่อรายการพัสดุ';
+        }
+        if ($redirect === 'plan_detail' && !empty($_POST['plan_id'])) {
+            header('Location: admin.php?view=plan_detail&id=' . intval($_POST['plan_id']));
+        } else {
+            header('Location: admin.php?view=tracking_detail&id=' . $project_id);
+        }
+        exit();
+    }
+
     // Import Multiple Items from Plan (via AI or Plan selection)
     if ($action === 'import_plan_items') {
         $project_id = intval($_POST['project_id'] ?? 0);
@@ -2412,7 +2438,7 @@ $all_projects = $projects_stmt->fetchAll();
                                             <th width="130px" style="text-align:center;">จำนวน/หน่วย</th>
                                             <th width="150px" style="text-align:right;">งบประมาณ (บาท)</th>
                                             <th width="220px">บริษัทผู้ชนะสัญญา</th>
-                                            <th width="70px" style="text-align:center;">จัดการ</th>
+                                            <th width="100px" style="text-align:center;">จัดการ</th>
                                         </tr>
                                     </thead>
                                     <tbody>
@@ -2438,11 +2464,21 @@ $all_projects = $projects_stmt->fetchAll();
                                             </td>
                                             <td style="text-align:center;">
                                                 <?php if ($admin_role !== 'executive'): ?>
-                                                    <a href="admin.php?action=delete_project_item&<?= csrf_query() ?>&id=<?= $item['id'] ?>&project_id=<?= $proj_id ?>" 
-                                                       class="btn btn-danger btn-icon-only" style="padding:2px 8px; font-size:0.75rem;" 
-                                                       onclick="return confirm('ยืนยันลบรายการนี้?')" title="ลบรายการ">
-                                                        ลบ
-                                                    </a>
+                                                    <div style="display:flex; gap:6px; justify-content:center; align-items:center;">
+                                                        <button type="button" class="btn btn-secondary btn-icon-only" style="padding:4px 8px; font-size:0.75rem;" title="แก้ไขรายการ"
+                                                                onclick="openEditItem(<?= $item['id'] ?>, <?= htmlspecialchars(json_encode($item['item_name'])) ?>, <?= htmlspecialchars(json_encode($item['quantity'] ?? '')) ?>, <?= json_encode($item['budget']) ?>, <?= htmlspecialchars(json_encode($item['note'] ?? '')) ?>)">
+                                                            <svg style="width:14px;height:14px;fill:currentColor;" viewBox="0 0 24 24">
+                                                                <path d="M3 17.25V21h3.75L17.81 9.94l-3.75-3.75L3 17.25zM20.71 7.04c.39-.39.39-1.02 0-1.41l-2.34-2.34c-.39-.39-1.02-.39-1.41 0l-1.83 1.83 3.75 3.75 1.83-1.83z"/>
+                                                            </svg>
+                                                        </button>
+                                                        <a href="admin.php?action=delete_project_item&<?= csrf_query() ?>&id=<?= $item['id'] ?>&project_id=<?= $proj_id ?>" 
+                                                           class="btn btn-danger btn-icon-only" style="padding:4px 8px; font-size:0.75rem;" 
+                                                           onclick="return confirm('ยืนยันลบรายการนี้?')" title="ลบรายการ">
+                                                            <svg style="width:14px;height:14px;fill:currentColor;" viewBox="0 0 24 24">
+                                                                <path d="M6 19c0 1.1.9 2 2 2h8c1.1 0 2-.9 2-2V7H6v12zM19 4h-3.5l-1-1h-5l-1 1H5v2h14V4z"/>
+                                                            </svg>
+                                                        </a>
+                                                    </div>
                                                 <?php endif; ?>
                                             </td>
                                         </tr>
@@ -3924,6 +3960,44 @@ $all_projects = $projects_stmt->fetchAll();
 
 
     <!-- Modal: Add Single Project Item -->
+    <!-- Modal: Edit Single Project Item -->
+    <div class="modal" id="edit-item-modal">
+        <div class="modal-content" style="max-width: 550px;">
+            <div class="modal-header">
+                <h3>แก้ไขรายการพัสดุในโครงการ</h3>
+                <button type="button" class="modal-close" onclick="closeModal('edit-item-modal')">&times;</button>
+            </div>
+            <form action="admin.php" method="POST" style="padding: 24px;">
+                <input type="hidden" name="action" value="edit_project_item">
+                <?= csrf_field() ?>
+                <input type="hidden" name="item_id" id="edit_item_id">
+                <input type="hidden" name="project_id" value="<?= $proj_id ?? 0 ?>">
+                <div class="form-group" style="margin-bottom: 16px;">
+                    <label>ชื่อรายการพัสดุ / ครุภัณฑ์ <span style="color:var(--danger)">*</span></label>
+                    <input type="text" name="item_name" id="edit_item_name" class="form-control" required>
+                </div>
+                <div class="form-row" style="display:flex; gap:16px; margin-bottom: 16px;">
+                    <div class="form-group" style="flex:1;">
+                        <label>จำนวน / หน่วยนับ</label>
+                        <input type="text" name="quantity" id="edit_item_quantity" class="form-control" placeholder="เช่น 1 เครื่อง">
+                    </div>
+                    <div class="form-group" style="flex:1;">
+                        <label>งบประมาณ (บาท)</label>
+                        <input type="number" step="0.01" name="budget" id="edit_item_budget" class="form-control" placeholder="0.00">
+                    </div>
+                </div>
+                <div class="form-group" style="margin-bottom: 20px;">
+                    <label>หมายเหตุ</label>
+                    <input type="text" name="note" id="edit_item_note" class="form-control" placeholder="หมายเหตุเพิ่มเติม (ถ้ามี)">
+                </div>
+                <div class="modal-footer" style="padding:0;">
+                    <button type="button" class="btn btn-secondary" onclick="closeModal('edit-item-modal')">ยกเลิก</button>
+                    <button type="submit" class="btn btn-primary">บันทึกการแก้ไข</button>
+                </div>
+            </form>
+        </div>
+    </div>
+
     <div class="modal" id="add-item-modal">
         <div class="modal-content" style="max-width: 550px;">
             <div class="modal-header">
@@ -4012,6 +4086,15 @@ $all_projects = $projects_stmt->fetchAll();
 
     <script>
     let globalAiItems = [];
+
+    function openEditItem(id, name, qty, budget, note) {
+        document.getElementById('edit_item_id').value = id;
+        document.getElementById('edit_item_name').value = name;
+        document.getElementById('edit_item_quantity').value = qty || '';
+        document.getElementById('edit_item_budget').value = (budget !== null && budget !== undefined) ? budget : '';
+        document.getElementById('edit_item_note').value = note || '';
+        showModal('edit-item-modal');
+    }
 
     function openImportPlanItemsModal(planId, projId) {
         document.getElementById('import_items_project_id').value = projId;
