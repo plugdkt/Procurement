@@ -4024,7 +4024,7 @@ $all_projects = $projects_stmt->fetchAll();
         formData.append('action', 'get_plan_ai_items');
         formData.append('plan_id', planId);
         formData.append('project_id', projId);
-        formData.append('<?= csrf_token_name() ?>', '<?= csrf_token_value() ?>');
+        formData.append('csrf_token', '<?= csrf_token() ?>');
 
         fetch('admin.php', { method: 'POST', body: formData })
             .then(res => res.json())
